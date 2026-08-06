@@ -161,6 +161,19 @@ playground/Checkpoints
 playground/Pretrained_models
 playground/Datasets
 
+# Generated model checkpoints (regardless of output root)
+**/[Cc]heckpoints/
+**/*.ckpt
+**/*.pth
+**/*.safetensors
+
+# Generated evaluation artifacts
+/playground/Evaluations/
+/playground/EvaluationLogs/
+/experiments/*/logs/
+**/eval_results/
+**/evaluation_results/
+
 eval/SimplerEnv
 
 results
