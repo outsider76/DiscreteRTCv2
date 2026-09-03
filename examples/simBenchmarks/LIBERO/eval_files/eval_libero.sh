@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STARVLA_DIR="${STARVLA_DIR:-$(cd "$(dirname "$0")/../../.." && pwd)}"
+STARVLA_DIR="${STARVLA_DIR:-$(cd "$(dirname "$0")/../../../.." && pwd)}"
 LIBERO_HOME="${LIBERO_HOME:-}"
 LIBERO_PYTHON="${LIBERO_PYTHON:-python}"
 CKPT="${CKPT:-${STARVLA_DIR}/playground/Checkpoints/libero_example/checkpoints/steps_50000_pytorch_model.pt}"
@@ -9,6 +9,7 @@ HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-6694}"
 TASK_SUITE_NAME="${TASK_SUITE_NAME:-libero_goal}"
 NUM_TRIALS_PER_TASK="${NUM_TRIALS_PER_TASK:-50}"
+MAX_TASKS="${MAX_TASKS:--1}"
 MUJOCO_GL_VALUE="${MUJOCO_GL_VALUE:-egl}"
 PYOPENGL_PLATFORM_VALUE="${PYOPENGL_PLATFORM_VALUE:-egl}"
 
@@ -19,7 +20,7 @@ if [[ -z "${LIBERO_HOME}" ]]; then
 fi
 
 cd "${STARVLA_DIR}"
-export LIBERO_CONFIG_PATH="${LIBERO_HOME}/libero"
+export LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-${HOME}/.libero}"
 export PYTHONPATH="${PYTHONPATH:-}:${LIBERO_HOME}:${STARVLA_DIR}"
 export MUJOCO_GL="${MUJOCO_GL_VALUE}"
 export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM_VALUE}"
@@ -34,4 +35,5 @@ VIDEO_OUT_PATH="${MODEL_ROOT}/results/${TASK_SUITE_NAME}/${FOLDER_NAME}"
   --args.port "${PORT}" \
   --args.task-suite-name "${TASK_SUITE_NAME}" \
   --args.num-trials-per-task "${NUM_TRIALS_PER_TASK}" \
+  --args.max-tasks "${MAX_TASKS}" \
   --args.video-out-path "${VIDEO_OUT_PATH}"

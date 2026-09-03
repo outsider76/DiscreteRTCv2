@@ -355,6 +355,52 @@ class PolicyNormProcessor:
         return self._transform
 
     # ------------------------------------------------------------------
+    # Forward path (env action -> model-normalized action)
+    # ------------------------------------------------------------------
+    def apply_actions(self, actions: np.ndarray) -> np.ndarray:
+        """Apply the training-time action normalization pipeline.
+
+        RTC conditions flow sampling on the unexecuted portion of a previous
+        action chunk.  Live clients keep that chunk in robot coordinates, so
+        the server must convert it back to exactly the normalized coordinates
+        used by the action head before applying inpainting guidance.
+
+        Args:
+            actions: shape ``(T, D)`` in environment/robot coordinates.
+
+        Returns:
+            ``(T, D)`` normalized actions in model coordinates.
+        """
+        actions = np.asarray(actions)
+        if actions.ndim != 2:
+            raise ValueError(f"Expected (T, D); got shape {actions.shape}")
+
+        data: Dict[str, np.ndarray] = {}
+        cursor = 0
+        for full_key in self._action_keys:
+            dim_k = self._action_key_dims.get(full_key, 1)
+            data[full_key] = np.asarray(
+                actions[..., cursor : cursor + dim_k], dtype=np.float32
+            ).copy()
+            cursor += dim_k
+
+        if cursor != actions.shape[-1]:
+            raise ValueError(
+                f"Sum of per-key dims ({cursor}) != action_dim "
+                f"({actions.shape[-1]}). action_keys={self._action_keys}, "
+                f"action_key_dims={self._action_key_dims}"
+            )
+
+        out = self._transform.apply(data)
+        parts: List[np.ndarray] = []
+        for full_key in self._action_keys:
+            value = out[full_key]
+            if isinstance(value, torch.Tensor):
+                value = value.detach().cpu().numpy()
+            parts.append(np.asarray(value))
+        return np.concatenate(parts, axis=-1)
+
+    # ------------------------------------------------------------------
     # Inverse path (model output → env action)
     # ------------------------------------------------------------------
     def unapply_actions(self, normalized_actions: np.ndarray) -> np.ndarray:

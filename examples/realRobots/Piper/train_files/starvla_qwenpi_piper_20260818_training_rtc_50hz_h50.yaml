@@ -1,0 +1,94 @@
+run_id: piper_pick_white_block_20260818_qwenpi_training_rtc_d10_50hz_h50
+run_root_dir: results/Checkpoints
+seed: 42
+wandb_entity: your_wandb_entity
+wandb_project: starVLA_piper
+is_debug: false
+version_id: "0.21"
+
+framework:
+  # Separate framework: the original QwenPI_v3 implementation is untouched.
+  name: QwenPI_v3_TrainingRTC
+  qwenvl:
+    base_vlm: ./playground/Pretrained_models/Qwen3-VL-4B-Instruct
+    attn_implementation: sdpa
+  action_model:
+    action_model_type: TrainingRTC_LayerwiseFM
+    action_dim: 7
+    state_dim: 7
+    # 50 samples at 50 Hz: one second of Piper motion.
+    action_horizon: 50
+    repeated_diffusion_steps: 2
+    # The real-world setup in arXiv:2512.05964v2 uses five denoising steps.
+    num_inference_timesteps: 5
+    add_pos_embed: true
+    max_seq_len: 1024
+    num_target_vision_tokens: 32
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    # Inclusive delay range [0, 10]. At 50 Hz this trains for up to 200 ms.
+    rtc_max_delay_steps: 10
+    rtc_delay_sampling: uniform
+    diffusion_model_cfg:
+      action_dit_hidden_dim: 1024
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      positional_embeddings: null
+      attention_head_dim: 64
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: ./data/piper_lerobot
+    data_mix: piper_pick_white_block_20260818_measured_50hz_h50
+    include_state: true
+    action_type: abs_qpos
+    action_mode: abs
+    sequential_step_sampling: false
+    per_device_batch_size: 1
+    load_all_data_for_training: true
+    obs_image_size: [224, 224]
+    delete_pause_frame: false
+    video_backend: torchvision_av
+    num_workers: 2
+    pin_memory: true
+
+trainer:
+  # Full warm-start: the TrainingRTC head intentionally has exactly the same
+  # parameter names and shapes as the already-trained QwenPI_v3 flow head.
+  pretrained_checkpoint: ./results/Checkpoints/piper_pick_white_block_20260818_qwenpi_measured_50hz_h50/checkpoints/steps_10000_pytorch_model.pt
+  freeze_modules: qwen_vl_interface
+
+  # Paper real-world protocol: 8,000 task fine-tuning updates.
+  max_train_steps: 8000
+  num_warmup_steps: 200
+  save_interval: 2000
+  eval_interval: 1000
+  learning_rate:
+    base: 1.0e-05
+    qwen_vl_interface: 1.0e-06
+    action_model: 5.0e-05
+    project_layers: 2.0e-05
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  loss_scale:
+    vla: 1.0
+    vlm: 0.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 8
+  gradient_checkpointing: true
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  save_format: pt
+  is_resume: false

@@ -69,6 +69,7 @@ class PolicyServerWrapper:
             framework = framework.to(torch.bfloat16)
         framework = framework.to(device).eval()
         self._framework = framework
+        self._supports_rtc = callable(getattr(framework, "predict_action_realtime", None))
 
         # Co-located metadata.
         model_cfg, norm_stats = read_mode_config(self._ckpt_path)
@@ -150,6 +151,8 @@ class PolicyServerWrapper:
                 "Eval clients must explicitly choose image count and order. "
                 "The server does not infer or reorder camera views from training config."
             ),
+            "supports_inference_time_rtc": self._supports_rtc,
+            "rtc_action_coordinates": "Client sends previous chunks in environment coordinates; server normalizes them.",
         }
         # Enrich with per-embodiment keys when a default processor already exists.
         if self._default_unnorm_key is not None:
@@ -190,6 +193,71 @@ class PolicyServerWrapper:
         out = self._framework.predict_action(examples=examples, **kwargs)
         normalized = np.asarray(out["normalized_actions"])  # (B, T, D)
 
+        unnorm = np.stack(
+            [proc.unapply_actions(normalized[b]) for b in range(normalized.shape[0])],
+            axis=0,
+        )
+        return {"actions": unnorm}
+
+    def predict_action_realtime(
+        self,
+        examples: List[dict],
+        prev_action_chunk: np.ndarray,
+        inference_delay: int,
+        unnorm_key: Optional[str] = None,
+        **kwargs,
+    ) -> Dict[str, np.ndarray]:
+        """Run inference-time RTC and return actions in robot coordinates.
+
+        ``prev_action_chunk`` is intentionally accepted in the same robot
+        coordinates returned by :meth:`predict_action`.  It is normalized via
+        the checkpoint's training transform before ΠGDM-guided flow sampling.
+        No simulated-delay training objective is used by this path.
+        """
+        if not self._supports_rtc:
+            raise RuntimeError(
+                f"Framework {type(self._framework).__name__} does not expose "
+                "predict_action_realtime"
+            )
+        if inference_delay <= 0:
+            raise ValueError("inference_delay must be positive for RTC")
+
+        effective_key = unnorm_key if unnorm_key is not None else self._default_unnorm_key
+        if effective_key is None:
+            if len(self._available_unnorm_keys) == 1:
+                effective_key = self._available_unnorm_keys[0]
+            else:
+                raise ValueError(
+                    "predict_action_realtime: unnorm_key not specified; "
+                    f"pass one of {self._available_unnorm_keys}"
+                )
+        proc = self._get_processor(effective_key)
+
+        previous = np.asarray(prev_action_chunk, dtype=np.float32)
+        if previous.ndim == 2:
+            previous = previous[None, ...]
+        if previous.ndim != 3:
+            raise ValueError(
+                "prev_action_chunk must have shape (T, D) or (B, T, D); "
+                f"got {previous.shape}"
+            )
+        if previous.shape[0] != len(examples):
+            raise ValueError(
+                f"Previous chunk batch {previous.shape[0]} does not match "
+                f"examples batch {len(examples)}"
+            )
+
+        normalized_previous = np.stack(
+            [proc.apply_actions(previous[b]) for b in range(previous.shape[0])],
+            axis=0,
+        )
+        out = self._framework.predict_action_realtime(
+            examples=examples,
+            prev_action_chunk_normalized=normalized_previous,
+            inference_delay=int(inference_delay),
+            **kwargs,
+        )
+        normalized = np.asarray(out["normalized_actions"])
         unnorm = np.stack(
             [proc.unapply_actions(normalized[b]) for b in range(normalized.shape[0])],
             axis=0,
