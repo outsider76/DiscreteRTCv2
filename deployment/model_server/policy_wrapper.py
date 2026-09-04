@@ -22,7 +22,7 @@ Exposed API:
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -31,6 +31,7 @@ from starVLA.model.framework.base_framework import baseframework, merge_config_o
 from starVLA.model.framework.share_tools import read_mode_config
 
 from deployment.model_server.policy_norm_processor import PolicyNormProcessor
+from deployment.model_server.action_constraints import GripperConstraint
 
 
 def _training_obs_image_size(model_cfg: Dict[str, Any]) -> Optional[List[int]]:
@@ -60,6 +61,7 @@ class PolicyServerWrapper:
         use_bf16: bool = False,
         unnorm_key: Optional[str] = None,
         config_overrides: Sequence[str] | None = None,
+        gripper_constraint: Mapping[str, Any] | None = None,
     ) -> None:
         self._ckpt_path = str(ckpt_path)
 
@@ -75,6 +77,11 @@ class PolicyServerWrapper:
         model_cfg, norm_stats = read_mode_config(self._ckpt_path)
         model_cfg = merge_config_overrides(model_cfg, config_overrides)
         self._model_cfg = model_cfg
+        self._gripper_constraint = (
+            GripperConstraint.from_mapping(gripper_constraint)
+            if gripper_constraint is not None
+            else None
+        )
 
         # The neural action horizon normally is the executable chunk length.
         # Representations such as B-splines may predict fewer parameters and
@@ -161,6 +168,11 @@ class PolicyServerWrapper:
             ),
             "supports_inference_time_rtc": self._supports_rtc,
             "rtc_action_coordinates": "Client sends previous chunks in environment coordinates; server normalizes them.",
+            "gripper_constraint": (
+                self._gripper_constraint.as_dict()
+                if self._gripper_constraint is not None
+                else None
+            ),
         }
         # Enrich with per-embodiment keys when a default processor already exists.
         if self._default_unnorm_key is not None:
@@ -205,6 +217,8 @@ class PolicyServerWrapper:
             [proc.unapply_actions(normalized[b]) for b in range(normalized.shape[0])],
             axis=0,
         )
+        if self._gripper_constraint is not None:
+            unnorm = self._gripper_constraint.apply(unnorm)
         return {"actions": unnorm}
 
     def predict_action_realtime(
@@ -270,4 +284,6 @@ class PolicyServerWrapper:
             [proc.unapply_actions(normalized[b]) for b in range(normalized.shape[0])],
             axis=0,
         )
+        if self._gripper_constraint is not None:
+            unnorm = self._gripper_constraint.apply(unnorm)
         return {"actions": unnorm}

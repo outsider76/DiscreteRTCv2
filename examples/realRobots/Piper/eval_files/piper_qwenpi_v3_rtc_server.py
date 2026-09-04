@@ -29,6 +29,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="KEY=VALUE",
     )
+    parser.add_argument(
+        "--binary-gripper",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Project decoded gripper output to 0/1 at --gripper-threshold (default: enabled).",
+    )
+    parser.add_argument("--gripper-threshold", type=float, default=0.3)
     add_server_recording_args(parser)
     return parser
 
@@ -112,11 +119,23 @@ def main(args: argparse.Namespace) -> None:
         make_policy_server,
     )
 
+    gripper_constraint = None
+    if args.binary_gripper:
+        if not 0.0 < args.gripper_threshold < 1.0:
+            raise ValueError("--gripper-threshold must lie strictly between 0 and 1")
+        gripper_constraint = {
+            "mode": "binary",
+            "dimension": -1,
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "threshold": args.gripper_threshold,
+        }
     wrapper = PolicyServerWrapper(
         ckpt_path=args.ckpt_path,
         device="cuda",
         use_bf16=args.use_bf16,
         config_overrides=args.config_override,
+        gripper_constraint=gripper_constraint,
     )
     if not isinstance(wrapper._framework, qwenpi_v3_type):
         raise TypeError(
