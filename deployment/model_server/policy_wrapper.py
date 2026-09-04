@@ -76,10 +76,15 @@ class PolicyServerWrapper:
         model_cfg = merge_config_overrides(model_cfg, config_overrides)
         self._model_cfg = model_cfg
 
-        # action_chunk_size = future_action_window_size + 1 (matches old client).
+        # The neural action horizon normally is the executable chunk length.
+        # Representations such as B-splines may predict fewer parameters and
+        # decode them to a longer executable chunk before returning here.
         action_model_cfg = model_cfg["framework"]["action_model"]
+        representation_cfg = model_cfg["framework"].get("action_representation", {})
 
-        if "action_horizon" in action_model_cfg:
+        if "executable_horizon" in representation_cfg:
+            self._action_chunk_size = int(representation_cfg["executable_horizon"])
+        elif "action_horizon" in action_model_cfg:
             self._action_chunk_size = int(action_model_cfg["action_horizon"])
         elif "future_action_window_size" in action_model_cfg:
             self._action_chunk_size = int(action_model_cfg["future_action_window_size"]) + 1
@@ -147,6 +152,9 @@ class PolicyServerWrapper:
             "default_unnorm_key": self._default_unnorm_key,
             "training_data_mix": self._model_cfg.get("datasets", {}).get("vla_data", {}).get("data_mix"),
             "training_obs_image_size": _training_obs_image_size(self._model_cfg),
+            "action_representation": self._model_cfg.get("framework", {}).get(
+                "action_representation", {"type": "direct"}
+            ),
             "eval_image_contract": (
                 "Eval clients must explicitly choose image count and order. "
                 "The server does not infer or reorder camera views from training config."

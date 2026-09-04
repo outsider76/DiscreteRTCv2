@@ -176,12 +176,18 @@ class VLATrainer(TrainerUtils):
             return
         if self.accelerator.is_main_process:
             try:
+                if isinstance(self.config, AccessTrackedConfig):
+                    wandb_config = self.config.unwrap()
+                else:
+                    wandb_config = self.config
+                wandb_config = OmegaConf.to_container(wandb_config, resolve=True)
                 wandb.init(
                     name=self.config.run_id,
                     dir=os.path.join(self.config.output_dir, "wandb"),
                     project=self.config.wandb_project,
                     entity=self.config.wandb_entity,
                     group="vla-train",
+                    config=wandb_config,
                 )
                 self._wandb_enabled = True
             except Exception as exc:
@@ -385,9 +391,13 @@ class VLATrainer(TrainerUtils):
         """Run simple action-eval on current batch and attach score to metrics."""
         examples = self._get_next_batch()
         actions = [example["action"] for example in examples]
-        output_dict = self.accelerator.unwrap_model(self.model).predict_action(
-            examples=examples, use_ddim=True, num_ddim_steps=20
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        predict_for_eval = getattr(
+            unwrapped_model,
+            "predict_action_parameters",
+            unwrapped_model.predict_action,
         )
+        output_dict = predict_for_eval(examples=examples, use_ddim=True, num_ddim_steps=20)
 
         if self.accelerator.is_main_process:
             normalized_actions = output_dict["normalized_actions"]

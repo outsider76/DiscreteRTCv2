@@ -1,0 +1,100 @@
+run_id: piper_pick_white_block_20260818_qwenpi_25hz_uniform_left_bspline_s2_h20_c13_gb32_30k
+run_root_dir: results/Checkpoints
+seed: 42
+wandb_entity: 401910710-university-of-california-berkeley
+wandb_project: starVLA_piper
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenPI_v3_UniformBSpline
+  qwenvl:
+    base_vlm: ./playground/Pretrained_models/Qwen3-VL-4B-Instruct
+    attn_implementation: flash_attention_2
+  action_model:
+    action_model_type: LayerwiseFM
+    action_dim: 7
+    state_dim: 7
+    action_horizon: 13
+    repeated_diffusion_steps: 2
+    num_inference_timesteps: 4
+    add_pos_embed: true
+    max_seq_len: 1024
+    num_target_vision_tokens: 32
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    diffusion_model_cfg:
+      action_dit_hidden_dim: 1024
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      positional_embeddings: null
+      attention_head_dim: 64
+  action_representation:
+    type: continuous_uniform_bspline
+    mode: uniform_left
+    action_dim: 7
+    frequency_hz: 25.0
+    executable_horizon: 20
+    num_control_points: 13
+    degree: 3
+    span_length_steps: 2
+    regularization: 1.0e-4
+    end_padding: true
+    implementation_version: uniform_left_extended_double_fit_v1
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: ./data
+    data_mix: piper_pick_white_block_20260818_25hz_uniform_left_bspline
+    controls_dataset_path: ./data/20260818_piper_pick_white_block_25hz_UniformBSpline
+    include_state: true
+    action_type: abs_qpos
+    action_mode: abs
+    sequential_step_sampling: false
+    per_device_batch_size: 8
+    load_all_data_for_training: true
+    obs_image_size: [224, 224]
+    delete_pause_frame: false
+    video_backend: torchvision_av
+    num_workers: 2
+    persistent_workers: true
+    prefetch_factor: 2
+    pin_memory: true
+
+trainer:
+  pretrained_checkpoint: null
+  freeze_modules: qwen_vl_interface
+  max_train_steps: 30000
+  num_warmup_steps: 500
+  save_interval: 10000
+  eval_interval: 1000
+  repeated_diffusion_steps: 2
+  learning_rate:
+    base: 1.0e-05
+    qwen_vl_interface: 1.0e-06
+    action_model: 1.0e-04
+    project_layers: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  loss_scale:
+    vla: 1.0
+    vlm: 0.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 20
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  save_format: pt
+  is_resume: false
