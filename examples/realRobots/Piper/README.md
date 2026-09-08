@@ -1,6 +1,6 @@
 # Piper + GELLO Data Collection
 
-This directory contains the scripts used to control a Piper robot with a GELLO leader and record demonstrations from the robot, the GELLO command stream, an Orbbec hand camera, and a RealSense global camera.
+This directory contains the scripts used to control a Piper robot with a GELLO leader and record demonstrations from the robot, the GELLO command stream, an Orbbec hand camera, and an OAK or RealSense global camera. OAK is the default global-camera backend.
 
 The collector is read-only with respect to the robot: `collect_data.py` subscribes to ROS 2 topics but does not publish robot commands.
 
@@ -18,8 +18,32 @@ The camera roles and default color topics are:
 
 | Camera | Role | ROS 2 topic |
 | --- | --- | --- |
-| Orbbec Dabai | Hand camera | `/camera/color/image_raw` |
-| Intel RealSense | Global camera | `/global_camera/camera/color/image_raw` |
+| Orbbec Dabai | Hand camera | `/camera/color/image_raw/compressed` |
+| Luxonis OAK (default) or Intel RealSense | Global camera | `/global_camera/camera/color/image_raw/compressed` |
+
+Both backends intentionally publish the same global image topic, so the collector
+does not need camera-specific topic arguments. The collector uses compressed
+image transport by default because Python subscribers could not keep up with two
+640x480 raw image topics. JPEG decoding runs in OpenCV's native code and the
+saved training MP4 format is unchanged.
+
+Install the OAK ROS driver and USB permission rule once:
+
+```bash
+cd /home/tams/dRTC/DiscreteRTCv2
+bash examples/realRobots/Piper/setup_oak_camera.sh
+```
+
+The setup script requests the sudo password, installs
+`ros-jazzy-depthai-ros-driver`, reloads the Luxonis `03e7` udev rule, and may
+ask you to unplug/replug the OAK camera. The normal camera stack does not need
+sudo for OAK access after this setup.
+
+The default Orbbec hand stream and OAK global stream are both 640x480 at 30 Hz.
+The OAK driver should report `USB SPEED: SUPER`. A 60 Hz OAK experiment can
+still be requested explicitly with `--global-fps 60` for both startup and
+collection, but it is not the default because this workstation did not sustain
+that rate reliably.
 
 ## Safety
 
@@ -48,7 +72,7 @@ The script performs the following operations:
 1. Configures the Piper CAN interface (`can0` by default).
 2. Starts the Piper ROS 2 control node.
 3. Starts the Orbbec hand-camera node.
-4. Starts the RealSense global-camera node.
+4. Starts the selected global-camera node (OAK by default).
 5. Waits for the required robot and camera topics.
 6. Starts the GELLO Piper robot server.
 7. Starts the GELLO leader control loop.
@@ -58,7 +82,7 @@ The script performs the following operations:
 Wait until the terminal prints:
 
 ```text
-Startup complete: Piper + GELLO + Orbbec + RealSense
+Startup complete: Piper + GELLO + Orbbec + OAK
 ```
 
 Keep this terminal running during data collection. Press `Ctrl+C` once to stop the complete stack. Logs for each managed process are written to the `/tmp/piper_gello_stack_<timestamp>` directory printed during startup.
@@ -73,8 +97,17 @@ bash examples/realRobots/Piper/start_piper_gello_stack.sh --build
 bash examples/realRobots/Piper/start_piper_gello_stack.sh \
   --gello-port /dev/serial/by-id/YOUR_DEVICE
 
-# Select a RealSense camera when multiple devices are connected
+# Use the previous RealSense global camera instead of OAK
 bash examples/realRobots/Piper/start_piper_gello_stack.sh \
+  --global-camera realsense
+
+# Explicitly select the default 30 Hz OAK rate
+bash examples/realRobots/Piper/start_piper_gello_stack.sh \
+  --global-camera oak --global-fps 30
+
+# Select a RealSense camera when multiple RealSense devices are connected
+bash examples/realRobots/Piper/start_piper_gello_stack.sh \
+  --global-camera realsense \
   --realsense-serial YOUR_SERIAL_NUMBER
 
 # Show all options or inspect commands without starting hardware
@@ -102,8 +135,11 @@ If Conda is not active, omit `conda deactivate`.
 
 The collector waits until robot feedback, TCP pose, GELLO commands, and both
 camera streams are available and fresh. By default it records independent raw
-streams at 100 Hz for robot state/action, 30 Hz for the Orbbec hand camera, and
-60 Hz for the RealSense global camera.
+streams at 100 Hz for robot state/action and 30 Hz for both the Orbbec hand
+camera and OAK global camera. When the startup stack uses RealSense, add
+`--global-camera-type realsense` to the collection command so `data.pkl`
+records the correct camera identity. Pass `--global-fps 60` explicitly only if
+the selected global camera was also started at 60 Hz.
 
 ## Collection controls
 
@@ -136,7 +172,8 @@ The collector starts once all streams are ready, records one 60-second episode, 
 --output-dir PATH          Episode output directory (default: data/piper_demos)
 --joint-fps FPS            Robot state/action sampling rate (default: 100)
 --hand-fps FPS             Orbbec MP4 rate (default: 30)
---global-fps FPS           RealSense MP4 rate (default: 60)
+--global-fps FPS           Global-camera MP4 rate (default: 30)
+--global-camera-type TYPE  Camera identity in metadata: oak (default) or realsense
 --max-data-age SECONDS     Maximum accepted stream age (default: 1.0)
 --image-width PIXELS       Saved image width (default: 640)
 --image-height PIXELS      Saved image height (default: 480)
@@ -157,6 +194,16 @@ python3 examples/realRobots/Piper/collect_data.py \
 
 Use `python3 examples/realRobots/Piper/collect_data.py --help` to see every topic override and option.
 
+To diagnose or deliberately use raw ROS images, override both topics explicitly:
+
+```bash
+python3 examples/realRobots/Piper/collect_data.py \
+  --hand-image-topic /camera/color/image_raw \
+  --global-image-topic /global_camera/camera/color/image_raw
+```
+
+Raw transport is not recommended for normal collection on this workstation.
+
 ## Episode format
 
 Each saved episode has its own timestamp-named directory:
@@ -169,14 +216,24 @@ data/piper_demos/Pick_white_block/20260814/
     └── global_image.mp4
 ```
 
-`data.pkl` contains independent robot and camera timelines:
+`data.pkl` contains independent robot and camera timelines. During save, camera
+frames are resampled over the robot time span at their configured MP4 rate. If
+a camera frame is late or missing, the nearest captured frame is repeated. This
+keeps both MP4 playback durations consistent with the demonstration instead of
+speeding up a sparse stream.
 
 - `timestamps`: Piper feedback message times relative to the first recorded frame. Every episode starts at `0.0` seconds.
 - `observations`: measured robot state, TCP pose, gripper state, and placeholders for the two video frames.
 - `actions`: GELLO targets received from `/control/joint_states`.
 - `camera_timestamps.hand`: one timestamp per frame in `hand_image.mp4`.
 - `camera_timestamps.global`: one timestamp per frame in `global_image.mp4`.
+- `camera_frame_source_timestamps`: the original camera acquisition timestamp
+  selected for every encoded frame; repeated values identify duplicated images.
+- `camera_source_timestamps`: timestamps of the camera frames actually received
+  before resampling.
+- `camera_resampling`: captured/encoded frame counts and capture-alignment error.
 - `stream_fps`: configured raw rates for the three streams.
+- `camera_sources`: camera identities (`hand=orbbec`, `global=oak` or `realsense`).
 
 Observation fields:
 
@@ -208,7 +265,9 @@ quaternions use XYZW ordering. The normalized gripper convention is
 
 The RGB images are encoded into the two MP4 files. Camera frames are associated
 with robot samples by timestamp during conversion; their raw indices are not
-expected to match robot sample indices.
+expected to match robot sample indices. Finalizing the timestamp-aligned videos
+happens after pressing `s` or `q`, so saving may take several seconds for a long
+episode. Do not interrupt the collector while it prints `Finalizing`.
 
 ## Verify a recorded episode
 
@@ -234,7 +293,15 @@ print("action keys:", data["actions"][0].keys())
 for camera, name in (("hand", "hand_image"), ("global", "global_image")):
     capture = cv2.VideoCapture(str(episode / f"{name}.mp4"))
     frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(name, "frames:", frames, "timestamps:", len(data["camera_timestamps"][camera]))
+    fps = float(capture.get(cv2.CAP_PROP_FPS))
+    print(
+        name,
+        "frames:", frames,
+        "fps:", fps,
+        "duration:", frames / fps,
+        "timestamps:", len(data["camera_timestamps"][camera]),
+        "captured:", len(data.get("camera_source_timestamps", {}).get(camera, [])),
+    )
     capture.release()
 PY
 ```
@@ -242,6 +309,11 @@ PY
 For a valid new-format episode, timestamps/observations/actions have matching
 lengths. Each camera timestamp list separately matches the corresponding MP4;
 camera frame counts do not need to match the robot sample count.
+
+The converter accepts legacy schema-v2 sparse videos as well as the new
+schema-v3 timestamp-aligned videos. For schema v3 it selects frames using the
+presentation clock but reports alignment against the original acquisition
+clock, so repeated frames do not hide camera dropouts in conversion diagnostics.
 
 ## Convert and fine-tune StarVLA
 
@@ -396,6 +468,10 @@ cd /home/tams/DiscreteRTCv2
 bash examples/realRobots/Piper/start_piper_camera_stack.sh
 ```
 
+This camera/VLA startup path launches the Piper node with `fast_mode:=false`,
+so `/control/joint_states` uses the SDK-smoothed `move_j` path. The GELLO
+startup keeps its existing `fast_mode:=true` default (`move_js`).
+
 This is a real robot motion. Before typing `YES`, clear the complete workspace
 and keep the emergency stop ready. Startup refuses to move when another
 `/control/joint_states` publisher is active, feedback is stale, or any joint is
@@ -504,7 +580,7 @@ Override a topic when necessary:
 python3 examples/realRobots/Piper/collect_data.py \
   --output-dir data/piper_demos \
   --hand-image-topic /YOUR/ORBBEC/TOPIC \
-  --global-image-topic /YOUR/REALSENSE/TOPIC \
+  --global-image-topic /YOUR/GLOBAL/CAMERA/TOPIC \
   --preview
 ```
 

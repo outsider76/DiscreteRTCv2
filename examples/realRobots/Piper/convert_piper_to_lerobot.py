@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Convert asynchronous Piper raw episodes to a uniform LeRobot v2.1 dataset.
 
-New raw episodes contain independent robot, Orbbec and RealSense timestamps.
+New raw episodes contain independent robot, Orbbec and global-camera timestamps.
 This converter creates a 50 Hz target clock by default and selects the nearest
 robot sample and nearest frame from each camera for every target timestamp.
+Schema-v3 episodes additionally retain the original camera acquisition time for
+every presentation frame, so alignment diagnostics still expose duplicated or
+stale images introduced while making the raw MP4 duration wall-time-correct.
 By default, both ``observation.state`` and the action trajectory come from
 Piper feedback; ``--action-source command`` preserves the older GELLO-command
 target convention. Older synchronized 30 Hz episodes are also supported.
@@ -40,6 +43,7 @@ ACTION_SOURCES = ("observation", "command")
 class CameraStream:
     path: Path
     timestamps: np.ndarray
+    capture_timestamps: np.ndarray
     width: int
     height: int
     source_fps: float
@@ -170,6 +174,7 @@ def _load_episode(path: Path, target_fps: float, action_source: str) -> Episode:
     state, action = _load_rows(data_path, observations, actions, action_source)
 
     raw_camera_timestamps = payload.get("camera_timestamps")
+    raw_frame_source_timestamps = payload.get("camera_frame_source_timestamps")
     cameras: dict[str, CameraStream] = {}
     for camera, filename in CAMERAS.items():
         video_path = path / filename
@@ -187,9 +192,22 @@ def _load_episode(path: Path, target_fps: float, action_source: str) -> Episode:
             timestamps = _validate_timestamps(
                 raw_camera_timestamps[camera], f"{data_path}: {camera}", frames
             )
+        if raw_frame_source_timestamps is None:
+            capture_timestamps = timestamps
+        else:
+            if camera not in raw_frame_source_timestamps:
+                raise ValueError(
+                    f"{data_path}: camera_frame_source_timestamps is missing {camera!r}"
+                )
+            capture_timestamps = _validate_timestamps(
+                raw_frame_source_timestamps[camera],
+                f"{data_path}: {camera} frame source",
+                frames,
+            )
         cameras[camera] = CameraStream(
             path=video_path,
             timestamps=timestamps,
+            capture_timestamps=capture_timestamps,
             width=width,
             height=height,
             source_fps=source_fps,
@@ -220,7 +238,7 @@ def _load_episode(path: Path, target_fps: float, action_source: str) -> Episode:
         indices = _nearest_indices(stream.timestamps, target_source_time)
         camera_indices[camera] = indices
         alignment_ms[camera] = (
-            np.abs(stream.timestamps[indices] - target_source_time) * 1000.0
+            np.abs(stream.capture_timestamps[indices] - target_source_time) * 1000.0
         )
 
     return Episode(

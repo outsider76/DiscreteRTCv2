@@ -8,13 +8,15 @@ Each saved episode has the same layout as bspline-policy's ``EpisodeWriter``::
       hand_image.mp4
       global_image.mp4
 
-The raw streams are intentionally recorded on independent clocks: robot
-state/action at 100 Hz, the Orbbec hand camera at 30 Hz, and the RealSense
-global camera at 60 Hz by default.  ``data.pkl`` stores robot ``timestamps``
-plus a ``camera_timestamps`` mapping whose entries correspond one-to-one with
-the frames in each MP4.  All timestamps use the first recorded robot sample as
-their common origin.  The converter later aligns these streams at its requested
-training frequency.
+The raw streams are intentionally captured on independent clocks: robot
+state/action at 100 Hz, the Orbbec hand camera at 30 Hz, and the OAK global
+camera at 30 Hz by default.  When an episode is saved, each camera video is
+resampled onto its configured constant-rate clock over the robot time span.
+Missing camera frames are filled with the nearest captured frame so MP4 playback
+duration remains faithful to wall time.  ``data.pkl`` stores one presentation
+timestamp and one original capture timestamp per encoded frame.  All timestamps
+use the first recorded robot sample as their common origin.  The converter later
+aligns these streams at its requested training frequency.
 
 This node only observes ROS topics.  It never publishes robot commands.
 """
@@ -43,7 +45,7 @@ import rclpy
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import Image, JointState
+from sensor_msgs.msg import CompressedImage, Image, JointState
 
 try:
     from agx_arm_msgs.msg import GripperStatus
@@ -146,12 +148,23 @@ def piper_forward_kinematics(joints: np.ndarray) -> tuple[np.ndarray, np.ndarray
     return transform[:3, 3].copy(), _rotation_matrix_to_xyzw(transform[:3, :3])
 
 
-def image_message_to_rgb(message: Image) -> np.ndarray:
+def image_message_to_rgb(message: Image | CompressedImage) -> np.ndarray:
     """Decode common ROS Image encodings without cv_bridge.
 
     Avoiding cv_bridge is intentional: the local GELLO environment currently
     uses NumPy 2 while the Jazzy cv_bridge extension was built with NumPy 1.
     """
+    if isinstance(message, CompressedImage):
+        encoded = np.frombuffer(message.data, dtype=np.uint8)
+        if encoded.size == 0:
+            raise ValueError("Compressed image payload is empty")
+        bgr = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise ValueError(
+                f"OpenCV could not decode compressed image format {message.format!r}"
+            )
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
     encoding = message.encoding.lower()
     height = int(message.height)
     width = int(message.width)
@@ -231,6 +244,10 @@ class StreamingMP4Writer:
                 "-an",
                 "-c:v",
                 "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "18",
                 "-pix_fmt",
                 "yuv420p",
                 "-movflags",
@@ -299,6 +316,183 @@ class StreamingMP4Writer:
             raise RuntimeError(f"ffmpeg failed for {self.path} (exit {return_code}): {stderr.strip()}")
 
 
+def _nearest_indices(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """Return monotonically increasing nearest-source indices for target times."""
+    right = np.searchsorted(source, target, side="left")
+    right = np.clip(right, 0, len(source) - 1)
+    left = np.maximum(right - 1, 0)
+    choose_right = np.abs(source[right] - target) < np.abs(target - source[left])
+    return np.where(choose_right, right, left).astype(np.int64)
+
+
+def _video_properties(path: Path) -> tuple[int, int, int, float]:
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        raise ValueError(f"Could not open {path}")
+    result = (
+        int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),
+        int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        int(capture.get(cv2.CAP_PROP_FRAME_COUNT)),
+        float(capture.get(cv2.CAP_PROP_FPS)),
+    )
+    capture.release()
+    if result[0] <= 0 or result[1] <= 0 or result[2] <= 0 or result[3] <= 0:
+        raise ValueError(f"{path}: invalid video metadata {result}")
+    return result
+
+
+def _resample_video_timeline(
+    path: Path,
+    source_timestamps: list[float],
+    start_timestamp: float,
+    end_timestamp: float,
+    target_fps: float,
+) -> tuple[list[float], list[float], dict[str, float]]:
+    """Atomically replace a sparse CFR video with a wall-time-correct CFR video.
+
+    The first returned list is the encoded frame presentation clock.  The second
+    records the actual camera acquisition time selected for every encoded frame.
+    Keeping both clocks lets downstream conversion distinguish a fresh image
+    from a duplicated image while retaining ordinary constant-rate MP4 files.
+    """
+    timestamps = np.asarray(source_timestamps, dtype=np.float64).reshape(-1)
+    if timestamps.size == 0:
+        raise ValueError(f"{path}: cannot resample an empty camera stream")
+    if not np.isfinite(timestamps).all() or np.any(np.diff(timestamps) < 0):
+        raise ValueError(f"{path}: source timestamps must be finite and non-decreasing")
+    if not np.isfinite(start_timestamp) or not np.isfinite(end_timestamp):
+        raise ValueError(f"{path}: robot timeline endpoints must be finite")
+    if end_timestamp < start_timestamp:
+        raise ValueError(f"{path}: robot timeline ends before it starts")
+
+    width, height, source_frames, _ = _video_properties(path)
+    if source_frames != timestamps.size:
+        raise ValueError(
+            f"{path}: video has {source_frames} frames but there are "
+            f"{timestamps.size} camera timestamps"
+        )
+
+    target_count = int(
+        np.floor((end_timestamp - start_timestamp) * target_fps + 1e-9)
+    ) + 1
+    target_timestamps = (
+        start_timestamp + np.arange(target_count, dtype=np.float64) / target_fps
+    )
+    indices = _nearest_indices(timestamps, target_timestamps)
+    selected_source_timestamps = timestamps[indices]
+    alignment_ms = np.abs(selected_source_timestamps - target_timestamps) * 1000.0
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg is required to finalize timestamp-aligned camera videos")
+    temporary_path = path.with_name(f".{path.stem}_timestamp_aligned.mp4")
+    if temporary_path.exists():
+        temporary_path.unlink()
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(target_fps),
+        "-i",
+        "-",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(temporary_path),
+    ]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        process.kill()
+        process.wait()
+        raise ValueError(f"Could not open {path} for timestamp resampling")
+
+    assert process.stdin is not None and process.stderr is not None
+    source_index = -1
+    frame: Optional[np.ndarray] = None
+    try:
+        for requested in indices:
+            requested_index = int(requested)
+            while source_index < requested_index:
+                ok, frame = capture.read()
+                source_index += 1
+                if not ok or frame is None:
+                    raise ValueError(
+                        f"{path}: failed to decode source frame {source_index}"
+                    )
+            assert frame is not None
+            process.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
+        process.stdin.close()
+        error_text = process.stderr.read().decode(errors="replace")
+        return_code = process.wait()
+        if return_code != 0:
+            raise RuntimeError(
+                f"ffmpeg failed while finalizing {path} (exit {return_code}): "
+                f"{error_text.strip()}"
+            )
+        output_width, output_height, output_frames, output_fps = _video_properties(
+            temporary_path
+        )
+        if (output_width, output_height) != (width, height):
+            raise RuntimeError(
+                f"{temporary_path}: resolution changed from {(width, height)} to "
+                f"{(output_width, output_height)}"
+            )
+        if output_frames != target_count or not np.isclose(
+            output_fps, target_fps, atol=1e-3
+        ):
+            raise RuntimeError(
+                f"{temporary_path}: expected {target_count} frames at {target_fps:g} Hz, "
+                f"got {output_frames} frames at {output_fps:g} Hz"
+            )
+        temporary_path.replace(path)
+    except Exception:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        if temporary_path.exists():
+            temporary_path.unlink()
+        raise
+    finally:
+        capture.release()
+
+    stats = {
+        "captured_frames": int(source_frames),
+        "encoded_frames": int(target_count),
+        "median_capture_alignment_ms": float(np.median(alignment_ms)),
+        "max_capture_alignment_ms": float(np.max(alignment_ms)),
+    }
+    return (
+        target_timestamps.tolist(),
+        selected_source_timestamps.tolist(),
+        stats,
+    )
+
+
 class EpisodeRecorder:
     """Stream one episode to a staging directory and atomically publish it on save."""
 
@@ -310,12 +504,17 @@ class EpisodeRecorder:
         joint_fps: float,
         hand_fps: float,
         global_fps: float,
+        global_camera_type: str = "oak",
     ):
         self.output_dir = output_dir.expanduser().resolve()
         self.stream_fps = {
             "robot": float(joint_fps),
             "hand": float(hand_fps),
             "global": float(global_fps),
+        }
+        self.camera_sources = {
+            "hand": "orbbec",
+            "global": str(global_camera_type),
         }
         created_at = datetime.now()
         self.episode_date = created_at.strftime("%Y%m%d")
@@ -326,9 +525,19 @@ class EpisodeRecorder:
         self.timestamps: list[float] = []
         self.observations: list[dict[str, Any]] = []
         self.actions: list[dict[str, np.ndarray]] = []
+        # Source timestamps count actual camera callbacks.  camera_timestamps is
+        # populated during save and corresponds one-to-one with finalized MP4
+        # frames on a regular presentation clock.
+        self.camera_source_timestamps: dict[str, list[float]] = {
+            camera: [] for camera in self.CAMERA_KEYS
+        }
         self.camera_timestamps: dict[str, list[float]] = {
             camera: [] for camera in self.CAMERA_KEYS
         }
+        self.camera_frame_source_timestamps: dict[str, list[float]] = {
+            camera: [] for camera in self.CAMERA_KEYS
+        }
+        self.camera_resampling: dict[str, dict[str, float]] = {}
         self.video_writers: dict[str, StreamingMP4Writer] = {}
         self._closed = False
 
@@ -373,7 +582,7 @@ class EpisodeRecorder:
             )
             self.video_writers[camera] = writer
         writer.write(frame)
-        self.camera_timestamps[camera].append(float(timestamp))
+        self.camera_source_timestamps[camera].append(float(timestamp))
 
     def _close_videos(self, suppress_errors: bool = False) -> None:
         errors = []
@@ -393,27 +602,59 @@ class EpisodeRecorder:
             raise RuntimeError("Cannot save an empty episode")
 
         missing_cameras = [
-            camera for camera in self.CAMERA_KEYS if not self.camera_timestamps[camera]
+            camera
+            for camera in self.CAMERA_KEYS
+            if not self.camera_source_timestamps[camera]
         ]
         if missing_cameras:
             raise RuntimeError(f"Cannot save episode without camera frames: {missing_cameras}")
 
         self._close_videos()
+        print("\nFinalizing timestamp-aligned camera videos...")
+        for camera in self.CAMERA_KEYS:
+            print(
+                f"  {camera}: {len(self.camera_source_timestamps[camera])} captured "
+                f"frames -> {self.stream_fps[camera]:g} Hz MP4",
+                flush=True,
+            )
+            (
+                self.camera_timestamps[camera],
+                self.camera_frame_source_timestamps[camera],
+                self.camera_resampling[camera],
+            ) = _resample_video_timeline(
+                self.staging_dir / f"{camera}_image.mp4",
+                self.camera_source_timestamps[camera],
+                self.timestamps[0],
+                self.timestamps[-1],
+                self.stream_fps[camera],
+            )
         origin = self.timestamps[0]
         robot_timestamps = [timestamp - origin for timestamp in self.timestamps]
         camera_timestamps = {
             camera: [timestamp - origin for timestamp in timestamps]
             for camera, timestamps in self.camera_timestamps.items()
         }
+        camera_source_timestamps = {
+            camera: [timestamp - origin for timestamp in timestamps]
+            for camera, timestamps in self.camera_source_timestamps.items()
+        }
+        camera_frame_source_timestamps = {
+            camera: [timestamp - origin for timestamp in timestamps]
+            for camera, timestamps in self.camera_frame_source_timestamps.items()
+        }
         with (self.staging_dir / "data.pkl").open("wb") as file:
             pickle.dump(
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "timestamps": robot_timestamps,
                     "observations": self.observations,
                     "actions": self.actions,
                     "camera_timestamps": camera_timestamps,
+                    "camera_source_timestamps": camera_source_timestamps,
+                    "camera_frame_source_timestamps": camera_frame_source_timestamps,
+                    "camera_resampling": self.camera_resampling,
                     "stream_fps": self.stream_fps,
+                    "camera_sources": self.camera_sources,
                     "kinematics": {
                         "observation_ee_pose": "measured /feedback/tcp_pose",
                         "action_ee_pose": "Piper MDH FK from action arm_joint_position",
@@ -482,14 +723,24 @@ class PiperCollectorNode(Node):
         self.create_subscription(JointState, args.feedback_topic, self._feedback_callback, robot_qos)
         self.create_subscription(JointState, args.command_topic, self._command_callback, robot_qos)
         self.create_subscription(PoseStamped, args.tcp_pose_topic, self._tcp_callback, robot_qos)
+        hand_image_type = (
+            CompressedImage
+            if args.hand_image_topic.rstrip("/").endswith("/compressed")
+            else Image
+        )
+        global_image_type = (
+            CompressedImage
+            if args.global_image_topic.rstrip("/").endswith("/compressed")
+            else Image
+        )
         self.create_subscription(
-            Image,
+            hand_image_type,
             args.hand_image_topic,
             lambda message: self._image_callback("hand", message),
             image_qos,
         )
         self.create_subscription(
-            Image,
+            global_image_type,
             args.global_image_topic,
             lambda message: self._image_callback("global", message),
             image_qos,
@@ -611,7 +862,7 @@ class PiperCollectorNode(Node):
                 self._joint_positions[-1] = _normalized_gripper(message.width, self.args.gripper_max_width)
                 self._joint_efforts[-1] = float(message.force)
 
-    def _image_callback(self, camera: str, message: Image) -> None:
+    def _image_callback(self, camera: str, message: Image | CompressedImage) -> None:
         try:
             image = image_message_to_rgb(message)
             if self.args.image_width > 0 and self.args.image_height > 0:
@@ -744,9 +995,15 @@ class Keyboard:
         return sys.stdin.read(1).lower() if readable else None
 
 
-def _show_preview(snapshot: CollectorSnapshot) -> Optional[str]:
+def _show_preview(
+    snapshot: CollectorSnapshot, global_camera_type: str
+) -> Optional[str]:
     panels = []
-    for label, key in (("Orbbec hand", "hand_image"), ("RealSense global", "global_image")):
+    global_label = f"{global_camera_type.upper()} global"
+    for label, key in (
+        ("Orbbec hand", "hand_image"),
+        (global_label, "global_image"),
+    ):
         rgb = snapshot.observation[key]
         height = 360
         width = max(1, round(rgb.shape[1] * height / rgb.shape[0]))
@@ -773,7 +1030,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=Path("data/piper_demos"))
     parser.add_argument("--joint-fps", type=float, default=100.0)
     parser.add_argument("--hand-fps", type=float, default=30.0, help="Orbbec MP4 rate")
-    parser.add_argument("--global-fps", type=float, default=60.0, help="RealSense MP4 rate")
+    parser.add_argument(
+        "--global-fps",
+        type=float,
+        default=30.0,
+        help="Global-camera MP4 rate (default: 30).",
+    )
+    parser.add_argument(
+        "--global-camera-type",
+        choices=("oak", "realsense"),
+        default="oak",
+        help="Global camera identity stored in data.pkl metadata (default: oak).",
+    )
     parser.add_argument(
         "--fps",
         type=float,
@@ -788,8 +1056,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--command-topic", default="/control/joint_states")
     parser.add_argument("--tcp-pose-topic", default="/feedback/tcp_pose")
     parser.add_argument("--gripper-feedback-topic", default="/feedback/gripper_status")
-    parser.add_argument("--hand-image-topic", default="/camera/color/image_raw")
-    parser.add_argument("--global-image-topic", default="/global_camera/camera/color/image_raw")
+    parser.add_argument(
+        "--hand-image-topic",
+        default="/camera/color/image_raw/compressed",
+        help="Orbbec Image or CompressedImage topic (default: compressed)",
+    )
+    parser.add_argument(
+        "--global-image-topic",
+        default="/global_camera/camera/color/image_raw/compressed",
+        help="Global-camera Image or CompressedImage topic (default: compressed)",
+    )
     parser.add_argument("--preview", action="store_true")
     parser.add_argument(
         "--auto-start",
@@ -837,10 +1113,11 @@ def main() -> int:
     print("\nPiper data collector started (this script does not publish robot commands)")
     print(f"Output directory: {args.output_dir}")
     print(f"Orbbec:   {args.hand_image_topic}")
-    print(f"RealSense:{args.global_image_topic}")
+    print(f"Global ({args.global_camera_type.upper()}): {args.global_image_topic}")
     print(
         f"Raw stream targets: robot={args.joint_fps:g} Hz, "
-        f"Orbbec={args.hand_fps:g} Hz, RealSense={args.global_fps:g} Hz"
+        f"Orbbec={args.hand_fps:g} Hz, "
+        f"{args.global_camera_type.upper()}={args.global_fps:g} Hz"
     )
     print("Controls: [r] start  [s] save  [d] discard  [q] save and quit\n")
     if not sys.stdin.isatty() and not args.auto_start:
@@ -857,6 +1134,7 @@ def main() -> int:
             joint_fps=args.joint_fps,
             hand_fps=args.hand_fps,
             global_fps=args.global_fps,
+            global_camera_type=args.global_camera_type,
         )
         node.set_recorder(result)
         print(f"\nRecording started: {result.episode_name}")
@@ -873,13 +1151,13 @@ def main() -> int:
             "robot": len(current.timestamps),
             **{
                 camera: len(timestamps)
-                for camera, timestamps in current.camera_timestamps.items()
+                for camera, timestamps in current.camera_source_timestamps.items()
             },
         }
         stream_rates = {}
         for stream, timestamps in {
             "robot": current.timestamps,
-            **current.camera_timestamps,
+            **current.camera_source_timestamps,
         }.items():
             stream_duration = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else 0.0
             stream_rates[stream] = (
@@ -888,10 +1166,19 @@ def main() -> int:
         episode_dir = current.save()
         print(f"\nSaved robot {len(current)} samples / {duration:.1f} seconds: {episode_dir}")
         print(
-            "Achieved raw rates: "
+            "Achieved capture rates: "
             + ", ".join(
                 f"{stream}={stream_rates[stream]:.2f} Hz ({stream_counts[stream]} samples)"
                 for stream in ("robot", "hand", "global")
+            )
+        )
+        print(
+            "Final MP4 streams: "
+            + ", ".join(
+                f"{camera}={len(current.camera_timestamps[camera])} frames "
+                f"at {current.stream_fps[camera]:g} Hz "
+                f"({current.camera_resampling[camera]['captured_frames']} captured)"
+                for camera in current.CAMERA_KEYS
             )
         )
 
@@ -905,7 +1192,9 @@ def main() -> int:
                 if args.preview and now >= next_preview_time:
                     preview_snapshot, _ = node.snapshot(args.max_data_age)
                     if preview_snapshot is not None:
-                        preview_key = _show_preview(preview_snapshot)
+                        preview_key = _show_preview(
+                            preview_snapshot, args.global_camera_type
+                        )
                     next_preview_time = now + 1.0 / 30.0
                 key = preview_key or keyboard.read()
 

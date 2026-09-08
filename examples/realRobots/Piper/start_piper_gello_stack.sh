@@ -9,6 +9,7 @@ readonly PIPER_CAMERA_WS="/home/tams/ros2_ws"
 readonly PIPER_ROS_SETUP="/opt/ros/jazzy/setup.bash"
 readonly PIPER_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 readonly PIPER_FASTDDS_UDP_PROFILE="${PIPER_SCRIPT_DIR}/fastdds_udp_only.xml"
+readonly PIPER_OAK_PARAMS="${PIPER_SCRIPT_DIR}/oak_global_camera.yaml"
 readonly PIPER_ORBBEC_CALIBRATION="${PIPER_CAMERA_WS}/src/desktop_grasp_pipeline/calibration_results/orbbec_color_camera_info.yaml"
 readonly PIPER_DEFAULT_GELLO_PORT="/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBENRJS-if00-port0"
 
@@ -16,6 +17,8 @@ piper_gello_port="${PIPER_DEFAULT_GELLO_PORT}"
 piper_can_interface="can0"
 piper_can_usb_address=""
 piper_realsense_serial=""
+piper_global_camera="oak"
+piper_global_fps="30"
 piper_wait_timeout=60
 piper_build=0
 piper_skip_can=0
@@ -26,6 +29,7 @@ piper_move_to_start=0
 piper_operator_menu=0
 piper_clean_fastdds_shm=0
 piper_fastdds_udp_only=0
+piper_fast_mode="true"
 piper_log_dir="/tmp/piper_gello_stack_$(date +%Y%m%d_%H%M%S)"
 
 usage() {
@@ -35,7 +39,7 @@ Usage: start_piper_gello_stack.sh [options]
 Start these managed processes:
   1. Piper AGX ROS 2 control node
   2. Orbbec Dabai camera
-  3. RealSense global camera
+  3. OAK (default) or RealSense global camera
   4. GELLO Piper ZMQ robot server
   5. GELLO leader control loop
 
@@ -44,6 +48,9 @@ Options:
   --can-interface NAME       SocketCAN name (default: can0).
   --can-usb-address ADDRESS  USB bus address passed to can_activate.sh.
   --realsense-serial SERIAL  Select one RealSense when several are connected.
+  --global-camera TYPE       Global camera backend: oak (default) or realsense.
+  --global-fps FPS           Global RGB frame rate (default: 30).
+  --oak-fps FPS              Backward-compatible alias for --global-fps.
   --wait-timeout SECONDS     ROS topic startup timeout (default: 60).
   --build                    Rebuild agx_arm_ctrl before launching.
   --skip-can                 Do not run can_activate.sh.
@@ -60,6 +67,8 @@ Options:
   --fastdds-udp-only         Disable Fast DDS shared-memory transport for this
                              stack and use UDPv4 (automatic fallback if SHM
                              cleanup fails).
+  --fast-mode                Use unsmoothed move_js joint control (default).
+  --no-fast-mode             Use the SDK-smoothed move_j joint control path.
   --dry-run                  Print commands without touching hardware.
   -h, --help                 Show this help.
 
@@ -112,6 +121,16 @@ while (($# > 0)); do
             piper_realsense_serial="$2"
             shift 2
             ;;
+        --global-camera)
+            (($# >= 2)) || die "--global-camera requires oak or realsense"
+            piper_global_camera="$2"
+            shift 2
+            ;;
+        --global-fps|--oak-fps)
+            (($# >= 2)) || die "$1 requires a value"
+            piper_global_fps="$2"
+            shift 2
+            ;;
         --wait-timeout)
             (($# >= 2)) || die "--wait-timeout requires a value"
             piper_wait_timeout="$2"
@@ -154,6 +173,14 @@ while (($# > 0)); do
             piper_fastdds_udp_only=1
             shift
             ;;
+        --fast-mode)
+            piper_fast_mode="true"
+            shift
+            ;;
+        --no-fast-mode)
+            piper_fast_mode="false"
+            shift
+            ;;
         --dry-run)
             piper_dry_run=1
             shift
@@ -169,6 +196,9 @@ while (($# > 0)); do
 done
 
 [[ "${piper_wait_timeout}" =~ ^[1-9][0-9]*$ ]] || die "--wait-timeout must be a positive integer"
+[[ "${piper_global_fps}" =~ ^[1-9][0-9]*$ ]] || die "--global-fps must be a positive integer"
+[[ "${piper_global_camera}" == "oak" || "${piper_global_camera}" == "realsense" ]] || \
+    die "--global-camera must be oak or realsense"
 ((!piper_move_to_start || piper_no_gello)) || die "--move-to-start requires --no-gello"
 ((!piper_operator_menu || (piper_no_gello && piper_move_to_start))) || \
     die "--operator-menu requires --no-gello --move-to-start"
@@ -183,6 +213,9 @@ require_file "${PIPER_AGX_WS}/install/setup.bash"
 require_file "${PIPER_AGX_WS}/src/agx_arm_ros/scripts/can_activate.sh"
 require_file "${PIPER_CAMERA_WS}/install/setup.bash"
 require_file "${PIPER_ORBBEC_CALIBRATION}"
+if [[ "${piper_global_camera}" == "oak" ]]; then
+    require_file "${PIPER_OAK_PARAMS}"
+fi
 if ((piper_move_to_start)); then
     require_file "${PIPER_SCRIPT_DIR}/move_to_demo_start.py"
     require_file "${PIPER_SCRIPT_DIR}/eval_files/piper_demo_start_statistics.json"
@@ -197,7 +230,7 @@ piper_command=(
     -p "arm_type:=piper"
     -p "effector_type:=agx_gripper"
     -p "tcp_offset:=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]"
-    -p fast_mode:=true  
+    -p "fast_mode:=${piper_fast_mode}"
 )
 if ((piper_no_gello)); then
     # The arm node auto-enables the hardware, but ignores all external commands
@@ -218,10 +251,34 @@ piper_realsense_command=(
     "camera_namespace:=global_camera"
     "camera_name:=camera"
     "enable_depth:=false"
-    "rgb_camera.color_profile:=640x480x60"
+    "rgb_camera.color_profile:=640x480x${piper_global_fps}"
 )
 if [[ -n "${piper_realsense_serial}" ]]; then
     piper_realsense_command+=("serial_no:=${piper_realsense_serial}")
+fi
+piper_oak_command=(
+    ros2 launch depthai_ros_driver camera.launch.py
+    "name:=oak"
+    "namespace:=global_camera"
+    "params_file:=${PIPER_OAK_PARAMS}"
+    "rs_compat:=true"
+    "enable_color:=true"
+    "enable_depth:=false"
+    "enable_infra1:=false"
+    "enable_infra2:=false"
+    "rectify_rgb:=false"
+    # depthai_ros_driver 2.12.2 selects one delimiter from depth_profile and
+    # applies it to all profiles, so color must use the default comma format.
+    "rgb_camera.color_profile:=640,480,${piper_global_fps}"
+)
+if [[ "${piper_global_camera}" == "oak" ]]; then
+    piper_global_camera_process="oak"
+    piper_global_camera_label="OAK"
+    piper_global_camera_command=("${piper_oak_command[@]}")
+else
+    piper_global_camera_process="realsense"
+    piper_global_camera_label="RealSense"
+    piper_global_camera_command=("${piper_realsense_command[@]}")
 fi
 piper_gello_server_command=(
     python3 "${PIPER_GELLO_ROOT}/experiments/launch_nodes.py" --robot piper
@@ -254,7 +311,7 @@ if ((piper_dry_run)); then
     fi
     print_command "${piper_command[@]}"
     print_command "${piper_orbbec_command[@]}"
-    print_command "${piper_realsense_command[@]}"
+    print_command "${piper_global_camera_command[@]}"
     if ((!piper_no_gello)); then
         print_command "${piper_gello_server_command[@]}"
         print_command "${piper_gello_control_command[@]}"
@@ -329,6 +386,9 @@ require_command setsid
 require_command stdbuf
 require_command ss
 require_command timeout
+if [[ "${piper_global_camera}" == "oak" ]] && ! ros2 pkg prefix depthai_ros_driver >/dev/null 2>&1; then
+    die "OAK selected but depthai_ros_driver is not installed. Run: bash ${PIPER_SCRIPT_DIR}/setup_oak_camera.sh"
+fi
 if ((!piper_skip_can)); then
     require_command sudo
 fi
@@ -408,17 +468,18 @@ cleanup() {
     local index
     for ((index = ${#piper_process_pids[@]} - 1; index >= 0; index--)); do
         local process_pid="${piper_process_pids[index]}"
-        if kill -0 "${process_pid}" 2>/dev/null; then
-            echo "[stop] ${piper_process_names[index]}"
-            kill -INT -- "-${process_pid}" 2>/dev/null || true
-        fi
+        echo "[stop] ${piper_process_names[index]}"
+        # start_process uses setsid, so its PID is also the managed process
+        # group ID. Signal the group even if the ros2 CLI group leader already
+        # exited; hardware/component child processes can otherwise be orphaned.
+        kill -INT -- "-${process_pid}" 2>/dev/null || true
     done
 
     local deadline=$((SECONDS + 5))
     while ((SECONDS < deadline)); do
         local any_alive=0
         for process_pid in "${piper_process_pids[@]}"; do
-            if kill -0 "${process_pid}" 2>/dev/null; then
+            if kill -0 -- "-${process_pid}" 2>/dev/null; then
                 any_alive=1
                 break
             fi
@@ -428,8 +489,26 @@ cleanup() {
     done
 
     for process_pid in "${piper_process_pids[@]}"; do
-        if kill -0 "${process_pid}" 2>/dev/null; then
-            kill -TERM -- "-${process_pid}" 2>/dev/null || true
+        kill -TERM -- "-${process_pid}" 2>/dev/null || true
+    done
+
+    deadline=$((SECONDS + 2))
+    while ((SECONDS < deadline)); do
+        local any_alive=0
+        for process_pid in "${piper_process_pids[@]}"; do
+            if kill -0 -- "-${process_pid}" 2>/dev/null; then
+                any_alive=1
+                break
+            fi
+        done
+        ((any_alive)) || break
+        sleep 0.2
+    done
+
+    for process_pid in "${piper_process_pids[@]}"; do
+        if kill -0 -- "-${process_pid}" 2>/dev/null; then
+            echo "[stop] Force-stopping process group ${process_pid}" >&2
+            kill -KILL -- "-${process_pid}" 2>/dev/null || true
         fi
         wait "${process_pid}" 2>/dev/null || true
     done
@@ -491,11 +570,11 @@ wait_for_port() {
 # Hardware-facing ROS nodes can initialize concurrently.
 start_process piper "${piper_command[@]}"
 start_process orbbec "${piper_orbbec_command[@]}"
-start_process realsense "${piper_realsense_command[@]}"
+start_process "${piper_global_camera_process}" "${piper_global_camera_command[@]}"
 
 wait_for_topic "/feedback/joint_states" "Piper feedback"
 wait_for_topic "/camera/color/image_raw" "Orbbec color"
-wait_for_topic "/global_camera/camera/color/image_raw" "RealSense color"
+wait_for_topic "/global_camera/camera/color/image_raw" "${piper_global_camera_label} global color"
 
 if ((piper_move_to_start)); then
     echo
@@ -515,13 +594,13 @@ if ((!piper_no_gello)); then
     check_processes
 
     echo
-    echo "Startup complete: Piper + GELLO + Orbbec + RealSense"
+    echo "Startup complete: Piper + GELLO + Orbbec + ${piper_global_camera_label}"
     echo "Run data collection in another terminal:"
     echo "  cd /home/tams/DiscreteRTCv2"
     echo "  python3 examples/realRobots/Piper/collect_data.py --output-dir data/piper_demos --preview"
 else
     echo
-    echo "Startup complete: Piper + Orbbec + RealSense (GELLO is NOT running)"
+    echo "Startup complete: Piper + Orbbec + ${piper_global_camera_label} (GELLO is NOT running)"
     if ((piper_move_to_start)); then
         echo "Initial state: demonstrated start pose reached; gripper is mostly open."
     fi
