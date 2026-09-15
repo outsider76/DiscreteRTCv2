@@ -1,0 +1,4 @@
+[submodule "BSplineEncoder"]
+	path = BSplineEncoder
+	url = https://github.com/outsider86/BSplineEncoder.git
+	branch = main
