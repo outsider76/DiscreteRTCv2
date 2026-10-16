@@ -1,13 +1,56 @@
 # Piper demos: data preparation, review and classify_blocks training handoff
 
-Status date: 2026-10-15. Nothing in this document was pushed or published.
+Status date: 2026-10-16 (review written 2026-10-15). See §0 for the current state of runs, uploads and code.
 
 | | |
 |---|---|
-| starVLA commit reviewed | `345c213` on `feature/data-collection` plus the uncommitted working tree (see §8) |
+| starVLA commit reviewed | `345c213` on `feature/data-collection` plus the then-uncommitted working tree (see §9); now committed (§0) |
 | BSplineEncoder submodule | `be3a559` (bumped from `5aede68`; tests: 382 passed, 2 skipped in env `starVLA`) |
 | Raw data source | `huggingface.co/datasets/DiscreteRTC/dRTC`, folder `piper_demos/`, revision `88a1916a887679dc70c01fa268bf5d6f4e604f5e` |
 | Python env | conda `starVLA` (Python 3.10, torch 2.7.0+cu128, accelerate 1.5.2, deepspeed 0.16.9, transformers 4.57.0) |
+
+## 0. Current status (2026-10-16)
+
+### Code
+- **Branch:** `feature/data-collection`. All Piper work, including what was uncommitted before this
+  review, is in the commits that follow `345c213`.
+- **Contract tests:** `tests/test_piper_demos_contract.py`, 24 tests passing. They cover:
+  - split filtering and the steps-cache key;
+  - budget ledger and signal handling;
+  - the training-state save barrier;
+  - raw vs B-spline config parity, and 4B vs 2B config parity;
+  - encoder geometry;
+  - the instruction-rewrite helper;
+  - short instructions kept in the datasets.
+- **Default backbone for new Piper runs:** Qwen3-VL-2B-Instruct-Action (§7). The 4B configs remain the
+  record of the 2026-10-15 runs.
+- **Dataset instructions:** kept short ("Classify the blocks." / "Hang the mug." / "Stack the cups."),
+  because the trained policies and their open-loop evaluations use them. The detailed sentences are opt-in
+  only (`preprocess_piper_demos.py --detailed-instructions`).
+- **Fixed during the runs:** a rank race in `VLATrainer._save_training_state`. Rank 0 renamed
+  `training_state.tmp` while rank 1 was still writing its RNG file, which crashed the raw run at step 5,000.
+  A barrier now follows `save_state`, and a regression test covers it.
+
+### classify_blocks policies (Qwen3-VL-4B-Instruct, LayerwiseFM, 2 GPUs, global batch 32)
+
+| Run | GPUs | Outcome | Wall time | Uploaded checkpoint |
+|---|---|---|---|---|
+| `piper_demos_classify_blocks_30hz_qwenpi_uniform_left_s2_h30_c18_2gpu_gb32_30k` (B-spline) | 2,3 | completed 30,000 steps, exit 0 (2026-10-16 00:29 UTC) | 6.67 h | step 30,000, HF commit `64e4b30f` |
+| `piper_demos_classify_blocks_30hz_qwenpi_raw_h30_2gpu_gb32_30k` (raw) | 0,1 | crashed at the step-5k save (race above); resumed from step 5,000; **stopped on request** with SIGTERM at step 21,342 (graceful save, exit 0, 2026-10-16 02:00 UTC) | 4.75 h counted (1.21 h + 3.54 h; the time it sat crashed is not counted) | step 20,000 (`--stopped-early`), HF commit `e8409148` |
+
+- **Upload location:** `DiscreteRTC/dRTC` (dataset repo), `StarVLA/<run_id>/`. Each folder holds:
+  - `checkpoints/steps_N_pytorch_model.pt` (10.9 GB, full bf16 state dict);
+  - `config.yaml`, `config.full.yaml`, `dataset_statistics.json`, `summary.jsonl`, `wall_time_ledger.json`.
+
+  This is the layout `from_pretrained` loads directly.
+- **Upload checks:** remote size and LFS SHA-256 match the local file. Each run directory has a
+  `checkpoint_upload.json` record.
+- **Local copies:**
+  - Raw: weights at steps 5k–20k and 21,342, plus a resumable `training_state` at 21,342. No `final_model`,
+    because the run was stopped early. Rerunning its launcher with free GPUs would resume to 30k
+    (5.25 h of the 10 h budget left; ≈ 1.9 h needed for the remaining 8,658 steps).
+  - B-spline: weights at steps 5k–30k plus `final_model`.
+- **Not done yet:** 2B GPU smoke test and timing; open-loop evaluation of the two classify_blocks policies.
 
 ## 1. Ready-to-run commands
 
@@ -273,7 +316,7 @@ dirs are gone (cannot confirm the HF uploads without checking the repo); unrefer
 
 ## 11. Remaining issues / not done
 
-1. **Full classify_blocks runs launched 2026-10-15 17:48 UTC** (raw on GPUs 0,1; spline on GPUs 2,3).
+1. **Full classify_blocks runs launched 2026-10-15 17:48 UTC** (raw on GPUs 0,1; spline on GPUs 2,3); outcome in §0.
    The raw run crashed at 19:03 while saving `training_state` at step 5,000: `accelerator.save_state` ends
    with each rank writing `random_states_<rank>.pkl`, and rank 0 renamed `training_state.tmp` before rank 1
    had finished (`RuntimeError: Parent directory .../training_state.tmp does not exist`). Fixed with a barrier
@@ -303,7 +346,7 @@ dirs are gone (cannot confirm the HF uploads without checking the repo); unrefer
 11. **Shared GPUs**: the launcher only refuses GPUs that are busy at launch time. Another job starting on
     the same GPUs later roughly doubled step time in smoke E; at 1.6 s/step 30k steps would not fit, and the
     budget would stop the run gracefully around step 21k. Use GPUs that stay exclusive for the 10 h.
-12. **Upload of classify_blocks checkpoints**: `deployment/upload/upload_piper_demos_starvla_checkpoints.py`
+12. **Upload of classify_blocks checkpoints** (done; see §0, which supersedes the plan below): `deployment/upload/upload_piper_demos_starvla_checkpoints.py`
     (started 2026-10-15 22:38 UTC, log `results/training_logs/piper_demos/upload_starvla_checkpoints.log`)
     waits until both runs have `steps_30000` and `final_model/`. It then uploads one commit per run to
     `DiscreteRTC/dRTC` (dataset repo) under `StarVLA/<run_name>/`: `checkpoints/steps_30000_pytorch_model.pt`,
