@@ -167,6 +167,29 @@ def _build_stats_cache_config(
     }
 
 
+def resolve_split_episode_ids(info: dict, split: str) -> set[int]:
+    """Episode indices of one ``meta/info.json`` split (LeRobot ``"start:end"`` ranges).
+
+    Used by the opt-in ``datasets.vla_data.episode_split`` key so training
+    trajectories and normalization statistics come from that split only.
+    """
+    splits = info.get("splits") or {}
+    if split not in splits:
+        raise KeyError(f"episode_split={split!r} not in meta/info.json splits {sorted(splits)}")
+    ranges = splits[split]
+    episode_ids: set[int] = set()
+    for part in ranges if isinstance(ranges, (list, tuple)) else str(ranges).split(","):
+        start, end = (int(value) for value in str(part).split(":"))
+        if not 0 <= start < end:
+            raise ValueError(f"invalid range {part!r} for split {split!r}")
+        episode_ids.update(range(start, end))
+    return episode_ids
+
+
+def _parquet_episode_index(path: Path) -> int:
+    return int(Path(path).stem.rsplit("_", 1)[-1])
+
+
 def _invalidate_legacy_stats_cache(stats_path: Path, reason: str) -> None:
     if not stats_path.exists():
         return
@@ -613,6 +636,11 @@ class LeRobotSingleDataset(Dataset):
 
         self._dataset_path = Path(dataset_path)
         self._dataset_name = self._dataset_path.name
+        self._episode_split = self.data_cfg.get("episode_split", None) if self.data_cfg else None
+        self._split_episode_ids = None
+        if self._episode_split:
+            with open(self._dataset_path / LE_ROBOT_INFO_FILENAME, "r") as f:
+                self._split_episode_ids = resolve_split_episode_ids(json.load(f), self._episode_split)
         if isinstance(embodiment_tag, EmbodimentTag):
             self.tag = embodiment_tag.value
         else:
@@ -633,6 +661,12 @@ class LeRobotSingleDataset(Dataset):
         self.curr_traj_id = None
 
         self._trajectory_ids, self._trajectory_lengths = self._get_trajectories()
+        if self._split_episode_ids is not None:
+            keep = np.isin(self._trajectory_ids, sorted(self._split_episode_ids))
+            if not keep.any():
+                raise ValueError(f"episode_split={self._episode_split!r} selects no episodes in {dataset_path}")
+            self._trajectory_ids = self._trajectory_ids[keep]
+            self._trajectory_lengths = self._trajectory_lengths[keep]
         self._modality_keys = self._get_modality_keys()
         self._delta_indices = self._get_delta_indices()
         self._all_steps = self._get_all_steps()
@@ -834,6 +868,18 @@ class LeRobotSingleDataset(Dataset):
         parquet_files_filtered = [
             pf for pf in parquet_files if "episode_033675.parquet" not in pf.name
         ]
+        if self._split_episode_ids is not None:
+            # Split-only statistics live in their own cache so whole-dataset
+            # caches (and other splits) are never overwritten or reused.
+            parquet_files_filtered = [
+                pf for pf in parquet_files_filtered if _parquet_episode_index(pf) in self._split_episode_ids
+            ]
+            stats_path = self.dataset_path / f"meta/stats_gr00t_{self._episode_split}.json"
+            stats_cache_config = {
+                **stats_cache_config,
+                "episode_split": self._episode_split,
+                "episode_ids": sorted(self._split_episode_ids),
+            }
 
         if is_main():
             le_statistics = _load_or_compute_statistics(
@@ -981,14 +1027,18 @@ class LeRobotSingleDataset(Dataset):
             return (not dist.is_initialized()) or dist.get_rank() == 0
     
         config_key = self._get_steps_config_key()
-        steps_filename = "steps_data_index.pkl"
+        steps_filename = (
+            f"steps_data_index_{self._episode_split}.pkl" if self._episode_split else "steps_data_index.pkl"
+        )
         steps_path = self.dataset_path / "meta" / steps_filename
+        trajectory_set = {int(t) for t in self.trajectory_ids}
     
         # ---------- try to read from cache  ----------
         if steps_path.exists():
             try:
                 with open(steps_path, "rb") as f:
                     cached_data = pickle.load(f)
+                self._check_cached_steps(cached_data, config_key, trajectory_set)
                 return cached_data["steps"]
             except Exception as e:
                 # include EOFError / PickleError / KeyError
@@ -1004,6 +1054,7 @@ class LeRobotSingleDataset(Dataset):
             cache_data = {
                 "config_key": config_key,
                 "steps": all_steps,
+                "trajectory_ids": sorted(trajectory_set),
                 "num_trajectories": len(self.trajectory_ids),
                 "total_steps": len(all_steps),
                 "computed_timestamp": pd.Timestamp.now().isoformat(),
@@ -1026,8 +1077,21 @@ class LeRobotSingleDataset(Dataset):
         # ---------- read by all rank ----------
         with open(steps_path, "rb") as f:
             cached_data = pickle.load(f)
+        self._check_cached_steps(cached_data, config_key, trajectory_set)
     
         return cached_data["steps"]
+
+    @staticmethod
+    def _check_cached_steps(cached_data: dict, config_key: str, trajectory_set: set[int]) -> None:
+        """Reject a steps cache built for other trajectories (e.g. another episode split)."""
+        if cached_data.get("config_key") != config_key:
+            raise ValueError("steps cache config_key mismatch")
+        cached_ids = cached_data.get("trajectory_ids")
+        if cached_ids is not None:
+            if set(map(int, cached_ids)) != trajectory_set:
+                raise ValueError("steps cache was built for a different trajectory set")
+        elif not {int(t) for t, _ in cached_data["steps"]} <= trajectory_set:
+            raise ValueError("steps cache contains trajectories outside this dataset/split")
 
     def _get_steps_config_key(self) -> str:
         """Generate a configuration key for steps caching."""
@@ -1035,6 +1099,11 @@ class LeRobotSingleDataset(Dataset):
             "delete_pause_frame": self.delete_pause_frame,
             "dataset_name": self.dataset_name,
         }
+        if self._episode_split:
+            config_dict["episode_split"] = self._episode_split
+            config_dict["episode_ids"] = hashlib.md5(
+                str(sorted(self._split_episode_ids)).encode()
+            ).hexdigest()
         # Create a hash of the configuration
         config_str = str(sorted(config_dict.items()))
         return hashlib.md5(config_str.encode()).hexdigest()[:12]  #

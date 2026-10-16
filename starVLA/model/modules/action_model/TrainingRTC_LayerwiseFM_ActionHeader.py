@@ -27,14 +27,23 @@ class TrainingRTCLayerwiseFlowmatchingActionHead(
 
     def __init__(self, global_config, **kwargs):
         super().__init__(global_config=global_config, **kwargs)
+        self.rtc_min_delay_steps = int(
+            getattr(self.config, "rtc_min_delay_steps", 0)
+        )
         self.rtc_max_delay_steps = int(
             getattr(self.config, "rtc_max_delay_steps", 10)
         )
-        if not 0 <= self.rtc_max_delay_steps < self.action_horizon:
+        if not (
+            0
+            <= self.rtc_min_delay_steps
+            <= self.rtc_max_delay_steps
+            < self.action_horizon
+        ):
             raise ValueError(
-                "rtc_max_delay_steps must satisfy "
-                f"0 <= delay < action_horizon={self.action_horizon}; "
-                f"got {self.rtc_max_delay_steps}"
+                "RTC prefix bounds must satisfy "
+                f"0 <= min <= max < action_horizon={self.action_horizon}; "
+                f"got min={self.rtc_min_delay_steps}, "
+                f"max={self.rtc_max_delay_steps}"
             )
         delay_sampling = str(
             getattr(self.config, "rtc_delay_sampling", "uniform")
@@ -201,10 +210,10 @@ class TrainingRTCLayerwiseFlowmatchingActionHead(
         return decoded[:, -self.action_horizon :]
 
     def _sample_training_delays(self, batch_size: int, device) -> torch.Tensor:
-        """Sample delays uniformly from 0 through rtc_max_delay_steps."""
+        """Sample completed-prefix lengths uniformly over the configured range."""
 
         return torch.randint(
-            low=0,
+            low=self.rtc_min_delay_steps,
             high=self.rtc_max_delay_steps + 1,
             size=(batch_size,),
             device=device,
@@ -306,6 +315,11 @@ class TrainingRTCLayerwiseFlowmatchingActionHead(
             raise ValueError(
                 f"inference_delay={inference_delay} exceeds trained maximum "
                 f"{self.rtc_max_delay_steps}"
+            )
+        if inference_delay < self.rtc_min_delay_steps:
+            raise ValueError(
+                f"inference_delay={inference_delay} is below trained minimum "
+                f"{self.rtc_min_delay_steps}"
             )
         if inference_delay >= self.action_horizon:
             raise ValueError("inference_delay must be smaller than action_horizon")

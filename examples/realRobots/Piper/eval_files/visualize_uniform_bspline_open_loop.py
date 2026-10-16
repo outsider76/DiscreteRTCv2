@@ -53,11 +53,15 @@ def _target_chunk(dataset_root: Path, episode_id: int, frame_id: int, horizon: i
     return actions[indices]
 
 
-def _episode_controls(controls_root: Path, episode_id: int) -> np.ndarray:
+def _episode_controls(
+    controls_root: Path,
+    episode_id: int,
+    expected_tail: tuple[int, int],
+) -> np.ndarray:
     path = controls_root / "data" / f"episode_{episode_id:06d}.npz"
     with np.load(path) as episode:
         controls = np.asarray(episode["controls"], dtype=np.float64)
-    if controls.ndim != 3 or controls.shape[1:] != (13, 7):
+    if controls.ndim != 3 or controls.shape[1:] != expected_tail:
         raise ValueError(f"Unexpected control shape in {path}: {controls.shape}")
     return controls
 
@@ -65,9 +69,14 @@ def _episode_controls(controls_root: Path, episode_id: int) -> np.ndarray:
 def _load_encoder(controls_root: Path):
     config = json.loads((controls_root / "encoder.json").read_text())["config"]
     encoder = create_encoder(UniformLeftBSplineConfig(**config))
-    if encoder.basis.shape != (20, 13):
+    expected = (encoder.config.chunk_size, encoder.config.num_basis)
+    if encoder.basis.shape != expected:
         raise ValueError(f"Unexpected decode basis: {encoder.basis.shape}")
     return encoder
+
+
+def _horizon_ticks(horizon: int) -> list[int]:
+    return sorted(set([1, max(1, horizon // 4), max(1, horizon // 2), max(1, 3 * horizon // 4), horizon]))
 
 
 def _predicted_physical_controls(
@@ -95,7 +104,8 @@ def make_dashboard(report: dict, arrays: dict[str, np.ndarray], output: Path) ->
     model = report["physical_action_prediction_vs_original_target"]
     baseline = report["current_action_persistence_baseline_vs_original_target"]
     spline = report["spline_representation_vs_original_target"]
-    horizons = np.arange(1, 21)
+    horizon = len(model["per_horizon"])
+    horizons = np.arange(1, horizon + 1)
 
     figure = plt.figure(figsize=(16, 10), facecolor="#F7F9FC")
     grid = figure.add_gridspec(
@@ -119,7 +129,7 @@ def make_dashboard(report: dict, arrays: dict[str, np.ndarray], output: Path) ->
         0.5,
         0.925,
         f"{report['evaluated_observations']:,} recorded observations • {report['episodes']} episodes • "
-        "20 actions at 25 Hz • training-set evaluation",
+        f"{horizon} actions at {report['action_frequency_hz']:g} Hz • training-set evaluation",
         ha="center",
         fontsize=10.5,
         color="#536078",
@@ -141,8 +151,8 @@ def make_dashboard(report: dict, arrays: dict[str, np.ndarray], output: Path) ->
         label="Repeat-current-action baseline",
     )
     axis.set(title="Error over the prediction horizon", xlabel="Future action step", ylabel="Physical-action RMSE")
-    axis.set_xticks([1, 4, 8, 12, 16, 20])
-    axis.set_xlim(1, 20)
+    axis.set_xticks(_horizon_ticks(horizon))
+    axis.set_xlim(1, horizon)
     _style_axis(axis)
     spline_axis = axis.twinx()
     spline_axis.plot(
@@ -261,11 +271,12 @@ def make_examples(
         color="#17223B",
         y=0.985,
     )
-    steps = np.arange(1, 21)
+    horizon = int(error.shape[1])
+    steps = np.arange(1, horizon + 1)
     for column, (row, title) in enumerate(zip(rows, titles)):
         episode_id = int(arrays["episode_index"][row])
         frame_id = int(arrays["frame_index"][row])
-        original = _target_chunk(dataset_root, episode_id, frame_id)
+        original = _target_chunk(dataset_root, episode_id, frame_id, horizon=horizon)
         predicted = original + arrays["prediction_vs_original_error"][row]
         spline_target = original + arrays["spline_vs_original_error"][row]
         axes[0, column].set_title(
@@ -283,7 +294,7 @@ def make_examples(
             axis.spines[["top", "right"]].set_visible(False)
             if dim == 6:
                 axis.set_xlabel("Future action step")
-                axis.set_xticks([1, 4, 8, 12, 16, 20])
+                axis.set_xticks(_horizon_ticks(horizon))
     handles, labels = axes[0, 0].get_legend_handles_labels()
     figure.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.955), ncol=3, frameon=False)
     figure.savefig(output, dpi=220, bbox_inches="tight", facecolor=figure.get_facecolor())
@@ -343,14 +354,23 @@ def make_bspline_control_figure(
         episode_id = int(arrays["episode_index"][row])
         frame_id = int(arrays["frame_index"][row])
         if episode_id not in controls_cache:
-            controls_cache[episode_id] = _episode_controls(controls_root, episode_id)
+            controls_cache[episode_id] = _episode_controls(
+                controls_root,
+                episode_id,
+                (int(encoder.config.num_basis), int(encoder.config.action_dim)),
+            )
         target_controls = controls_cache[episode_id][frame_id]
         predicted_controls = _predicted_physical_controls(
             target_controls,
             np.asarray(arrays["control_error"][row], dtype=np.float64),
             report,
         )
-        original = _target_chunk(dataset_root, episode_id, frame_id)
+        original = _target_chunk(
+            dataset_root,
+            episode_id,
+            frame_id,
+            horizon=int(encoder.config.chunk_size),
+        )
         target_spline = BSpline(knots, target_controls, degree, extrapolate=False, axis=0)
         predicted_spline = BSpline(knots, predicted_controls, degree, extrapolate=False, axis=0)
         target_dense = target_spline(dense_steps)
@@ -451,22 +471,81 @@ def make_bspline_control_figure(
     plt.close(figure)
 
 
+def make_progression(summary: dict, output: Path) -> None:
+    rows = summary["checkpoint_progression_seed_42"]
+    steps = np.asarray([row["step"] for row in rows], dtype=np.int64)
+    decoded = np.asarray([row["decoded_physical_action_rmse"] for row in rows])
+    first = np.asarray([row["first_action_rmse"] for row in rows])
+    gripper = np.asarray([row["gripper_rmse"] for row in rows])
+    persistence = np.asarray([row["persistence_baseline_rmse"] for row in rows])
+    representation = float(summary["representation_only_rmse"])
+
+    figure, axes = plt.subplots(1, 2, figsize=(13.5, 5.2), facecolor="#F7F9FC")
+    figure.subplots_adjust(left=0.07, right=0.98, bottom=0.15, top=0.80, wspace=0.25)
+    figure.suptitle(
+        "Uniform-left B-spline policy — open-loop checkpoint progression",
+        fontsize=18,
+        fontweight="bold",
+        color="#17223B",
+    )
+    figure.text(
+        0.5,
+        0.875,
+        "Same 4,096 evenly spaced observations across all 50 episodes • seed 42",
+        ha="center",
+        fontsize=10.5,
+        color="#536078",
+    )
+
+    axis = axes[0]
+    axis.plot(steps, decoded, marker="o", linewidth=2.5, color=MODEL_COLOR, label="Full 30-step chunk")
+    axis.plot(steps, first, marker="s", linewidth=2.2, color="#7A5BC7", label="First action")
+    axis.plot(steps, gripper, marker="^", linewidth=2.2, color="#C84B55", label="Gripper")
+    axis.axhline(persistence[0], color=BASELINE_COLOR, linestyle="--", linewidth=1.8, label="Persistence baseline")
+    axis.axhline(representation, color=SPLINE_COLOR, linestyle=":", linewidth=2.0, label="Representation only")
+    axis.set(xlabel="Training step", ylabel="Physical-action RMSE", title="Prediction error")
+    axis.set_xticks(steps, [f"{step // 1000}k" for step in steps])
+    axis.legend(frameon=False, fontsize=8.5)
+    _style_axis(axis)
+
+    axis = axes[1]
+    reduction = 100.0 * np.asarray([row["mse_reduction_vs_persistence"] for row in rows])
+    bars = axis.bar(np.arange(len(steps)), reduction, color=["#9AB8D0", "#5F94BC", MODEL_COLOR])
+    axis.bar_label(bars, labels=[f"{value:.1f}%" for value in reduction], padding=4, fontsize=10)
+    axis.set(
+        xlabel="Training step",
+        ylabel="MSE reduction (%)",
+        title="Improvement over repeat-current-action baseline",
+    )
+    axis.set_xticks(np.arange(len(steps)), [f"{step // 1000}k" for step in steps])
+    axis.set_ylim(0, 105)
+    _style_axis(axis)
+
+    figure.savefig(output, dpi=220, bbox_inches="tight", facecolor=figure.get_facecolor())
+    figure.savefig(output.with_suffix(".svg"), bbox_inches="tight", facecolor=figure.get_facecolor())
+    plt.close(figure)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--controls-dataset", type=Path, default=DEFAULT_CONTROLS_DATASET)
+    parser.add_argument("--report-name", default="open_loop_evaluation_all.json")
+    parser.add_argument("--arrays-name", default="open_loop_errors_all.npz")
+    parser.add_argument("--output-prefix", default="open_loop")
+    parser.add_argument("--comparison-summary", type=Path)
     args = parser.parse_args()
     run_dir = args.run_dir.expanduser().resolve()
     dataset_root = args.dataset.expanduser().resolve()
     controls_root = args.controls_dataset.expanduser().resolve()
-    report = json.loads((run_dir / "open_loop_evaluation_all.json").read_text())
-    with np.load(run_dir / "open_loop_errors_all.npz") as archive:
+    report = json.loads((run_dir / args.report_name).read_text())
+    with np.load(run_dir / args.arrays_name) as archive:
         arrays = {key: archive[key] for key in archive.files}
 
-    dashboard = run_dir / "open_loop_dashboard.png"
-    examples = run_dir / "open_loop_examples.png"
-    controls = run_dir / "open_loop_bspline_controls.png"
+    dashboard = run_dir / f"{args.output_prefix}_dashboard.png"
+    examples = run_dir / f"{args.output_prefix}_examples.png"
+    controls = run_dir / f"{args.output_prefix}_bspline_controls.png"
     make_dashboard(report, arrays, dashboard)
     make_examples(report, arrays, dataset_root, examples)
     encoder = _load_encoder(controls_root)
@@ -474,6 +553,11 @@ def main() -> None:
     print(dashboard)
     print(examples)
     print(controls)
+    if args.comparison_summary is not None:
+        summary_path = args.comparison_summary.expanduser().resolve()
+        progression = run_dir / f"{args.output_prefix}_checkpoint_progression.png"
+        make_progression(json.loads(summary_path.read_text()), progression)
+        print(progression)
 
 
 if __name__ == "__main__":

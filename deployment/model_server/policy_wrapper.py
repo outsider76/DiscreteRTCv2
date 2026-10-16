@@ -88,8 +88,23 @@ class PolicyServerWrapper:
         # decode them to a longer executable chunk before returning here.
         action_model_cfg = model_cfg["framework"]["action_model"]
         representation_cfg = model_cfg["framework"].get("action_representation", {})
+        self._rtc_conditioning_space = representation_cfg.get(
+            "rtc_conditioning_space", "decoded_actions"
+        )
 
-        if "executable_horizon" in representation_cfg:
+        self._variable_action_horizon = (
+            representation_cfg.get("execution_horizon_mode")
+            == "predicted_duration_sum"
+        )
+        self._max_action_chunk_size = None
+        if self._variable_action_horizon:
+            self._action_chunk_size = None
+            self._max_action_chunk_size = int(
+                representation_cfg["max_native_horizon"]
+            )
+            if self._max_action_chunk_size < 1:
+                raise ValueError("Adaptive max_native_horizon must be positive")
+        elif "executable_horizon" in representation_cfg:
             self._action_chunk_size = int(representation_cfg["executable_horizon"])
         elif "action_horizon" in action_model_cfg:
             self._action_chunk_size = int(action_model_cfg["action_horizon"])
@@ -113,9 +128,10 @@ class PolicyServerWrapper:
             default_proc = self._get_processor(unnorm_key)
             self._default_unnorm_key = default_proc.unnorm_key
             logging.info(
-                "PolicyServerWrapper ready: action_chunk_size=%d, default_unnorm_key=%s, "
-                "available_unnorm_keys=%s, action_keys=%s, state_keys=%s",
+                "PolicyServerWrapper ready: action_chunk_size=%s, variable=%s, "
+                "default_unnorm_key=%s, available_unnorm_keys=%s, action_keys=%s, state_keys=%s",
                 self._action_chunk_size,
+                self._variable_action_horizon,
                 default_proc.unnorm_key,
                 default_proc.available_unnorm_keys,
                 default_proc.action_keys,
@@ -155,6 +171,11 @@ class PolicyServerWrapper:
             "env": "starvla_policy_server",
             "ckpt_path": self._ckpt_path,
             "action_chunk_size": self._action_chunk_size,
+            "action_chunk_size_variable": self._variable_action_horizon,
+            "max_action_chunk_size": self._max_action_chunk_size,
+            "action_length_field": (
+                "action_lengths" if self._variable_action_horizon else None
+            ),
             "available_unnorm_keys": self._available_unnorm_keys,
             "default_unnorm_key": self._default_unnorm_key,
             "training_data_mix": self._model_cfg.get("datasets", {}).get("vla_data", {}).get("data_mix"),
@@ -166,8 +187,20 @@ class PolicyServerWrapper:
                 "Eval clients must explicitly choose image count and order. "
                 "The server does not infer or reorder camera views from training config."
             ),
-            "supports_inference_time_rtc": self._supports_rtc,
-            "rtc_action_coordinates": "Client sends previous chunks in environment coordinates; server normalizes them.",
+            "supports_inference_time_rtc": (
+                self._supports_rtc
+                and self._rtc_conditioning_space == "decoded_actions"
+            ),
+            "supports_parameter_row_rtc": (
+                self._supports_rtc
+                and self._rtc_conditioning_space == "spline_parameter_rows"
+            ),
+            "rtc_conditioning_space": self._rtc_conditioning_space,
+            "rtc_action_coordinates": (
+                "Client sends previous chunks in environment coordinates; server normalizes them."
+                if self._rtc_conditioning_space == "decoded_actions"
+                else "RTC prefixes are normalized spline parameter rows; decoded robot actions are not accepted."
+            ),
             "gripper_constraint": (
                 self._gripper_constraint.as_dict()
                 if self._gripper_constraint is not None
@@ -212,6 +245,18 @@ class PolicyServerWrapper:
 
         out = self._framework.predict_action(examples=examples, **kwargs)
         normalized = np.asarray(out["normalized_actions"])  # (B, T, D)
+        action_lengths = out.get("action_lengths")
+        if self._variable_action_horizon:
+            if action_lengths is None:
+                raise ValueError("Adaptive framework omitted action_lengths")
+            action_lengths = np.asarray(action_lengths, dtype=np.int64)
+            if action_lengths.shape != (normalized.shape[0],):
+                raise ValueError(
+                    f"Adaptive action_lengths must have shape {(normalized.shape[0],)}, "
+                    f"got {action_lengths.shape}"
+                )
+            if np.any(action_lengths < 1) or np.any(action_lengths > normalized.shape[1]):
+                raise ValueError("Adaptive action_lengths exceed the returned padded action tensor")
 
         unnorm = np.stack(
             [proc.unapply_actions(normalized[b]) for b in range(normalized.shape[0])],
@@ -219,7 +264,14 @@ class PolicyServerWrapper:
         )
         if self._gripper_constraint is not None:
             unnorm = self._gripper_constraint.apply(unnorm)
-        return {"actions": unnorm}
+        result = {"actions": unnorm}
+        if action_lengths is not None:
+            result["action_lengths"] = action_lengths
+            if "action_lengths_uncapped" in out:
+                result["action_lengths_uncapped"] = np.asarray(
+                    out["action_lengths_uncapped"], dtype=np.int64
+                )
+        return result
 
     def predict_action_realtime(
         self,
@@ -240,6 +292,13 @@ class PolicyServerWrapper:
             raise RuntimeError(
                 f"Framework {type(self._framework).__name__} does not expose "
                 "predict_action_realtime"
+            )
+        if self._rtc_conditioning_space != "decoded_actions":
+            raise RuntimeError(
+                "PolicyServerWrapper.predict_action_realtime accepts previous decoded "
+                "robot actions, but this checkpoint was trained with RTC prefixes in "
+                f"{self._rtc_conditioning_space!r}. Use a representation-aware parameter "
+                "prefix adapter; treating control rows as executed actions is invalid."
             )
         if inference_delay <= 0:
             raise ValueError("inference_delay must be positive for RTC")

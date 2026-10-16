@@ -6,6 +6,7 @@ assets
 playground
 wheels
 results
+ARCHIVE
 experiments
 wandb
 tf-logs

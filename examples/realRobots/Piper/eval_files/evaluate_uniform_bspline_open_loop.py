@@ -4,7 +4,9 @@
 Every observation is evaluated independently from the recorded state and two
 camera views. Predicted actions are never fed back as later observations. The
 report separates model error from the B-spline representation's reconstruction
-error against the original 20-step physical-action target.
+error against the original physical-action target.  The executable horizon,
+control count, action dimension, and sample rate are read from the training
+configuration rather than assumed to be the original 20/13/25 Hz setup.
 """
 
 from __future__ import annotations
@@ -77,13 +79,13 @@ def _control_metrics(error: np.ndarray) -> dict:
     }
 
 
-def _load_raw_episode_actions(dataset) -> dict[int, np.ndarray]:
+def _load_raw_episode_actions(dataset, action_dim: int) -> dict[int, np.ndarray]:
     result = {}
     for trajectory_id, trajectory_length in zip(dataset.trajectory_ids, dataset.trajectory_lengths):
         episode_id = int(trajectory_id)
         frame = dataset.get_trajectory_data(episode_id)
         actions = np.stack(frame["action"].to_numpy()).astype(np.float32)
-        expected = (int(trajectory_length), 7)
+        expected = (int(trajectory_length), action_dim)
         if actions.shape != expected or not np.isfinite(actions).all():
             raise ValueError(f"Episode {episode_id} action shape/content mismatch: {actions.shape}, expected {expected}")
         result[episode_id] = actions
@@ -95,10 +97,11 @@ def _raw_action_chunks(
     raw_actions: dict[int, np.ndarray],
     sample_indices: np.ndarray,
     horizon: int,
+    action_dim: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     episode_ids = np.empty(len(sample_indices), dtype=np.int64)
     frame_ids = np.empty(len(sample_indices), dtype=np.int64)
-    chunks = np.empty((len(sample_indices), horizon, 7), dtype=np.float32)
+    chunks = np.empty((len(sample_indices), horizon, action_dim), dtype=np.float32)
     for row, sample_index in enumerate(sample_indices):
         episode_id, frame_id = dataset.all_steps[int(sample_index)]
         episode_id, frame_id = int(episode_id), int(frame_id)
@@ -138,6 +141,22 @@ def main() -> None:
     from starVLA.dataloader.lerobot_datasets import get_vla_dataset
 
     cfg = OmegaConf.load(config_path)
+    representation = cfg.framework.action_representation
+    if str(representation.mode) != "uniform_left":
+        raise ValueError(f"Expected uniform_left representation, got {representation.mode}")
+    action_dim = int(representation.action_dim)
+    horizon = int(representation.executable_horizon)
+    num_controls = int(representation.num_control_points)
+    frequency_hz = float(representation.frequency_hz)
+    degree = int(representation.degree)
+    span_length_steps = int(representation.span_length_steps)
+    if action_dim != len(ACTION_NAMES):
+        raise ValueError(
+            f"This Piper evaluator expects {len(ACTION_NAMES)} action dimensions, got {action_dim}"
+        )
+    if int(cfg.framework.action_model.action_horizon) != num_controls:
+        raise ValueError("Action-head horizon does not match the configured control count")
+
     dataset = get_vla_dataset(cfg.datasets.vla_data, mode="val").datasets[0]
     total_observations = len(dataset)
     if args.max_samples is None or args.max_samples >= total_observations:
@@ -149,9 +168,9 @@ def main() -> None:
             np.linspace(0, total_observations - 1, args.max_samples, dtype=np.int64)
         )
 
-    raw_actions = _load_raw_episode_actions(dataset)
+    raw_actions = _load_raw_episode_actions(dataset, action_dim)
     raw_targets, episode_ids, frame_ids = _raw_action_chunks(
-        dataset, raw_actions, sample_indices, horizon=20
+        dataset, raw_actions, sample_indices, horizon=horizon, action_dim=action_dim
     )
 
     subset = Subset(dataset, sample_indices.tolist())
@@ -174,6 +193,28 @@ def main() -> None:
     )
     model = policy._framework
     processor = policy.get_norm_processor()
+    controls_root = Path(str(cfg.datasets.vla_data.controls_dataset_path))
+    if not controls_root.is_absolute():
+        controls_root = (REPO_ROOT / controls_root).resolve()
+    encoder_payload = json.loads((controls_root / "encoder.json").read_text())
+    from spline_encoder import UniformLeftBSplineConfig, create_encoder
+
+    sidecar_encoder = create_encoder(UniformLeftBSplineConfig(**encoder_payload["config"]))
+    sidecar_basis = np.asarray(sidecar_encoder.basis, dtype=np.float32)
+    model_basis = np.asarray(model._bspline_decode_basis, dtype=np.float32)
+    expected_basis_shape = (horizon, num_controls)
+    if sidecar_basis.shape != expected_basis_shape or model_basis.shape != expected_basis_shape:
+        raise ValueError(
+            f"Unexpected B-spline basis shape: sidecar={sidecar_basis.shape}, "
+            f"model={model_basis.shape}, expected={expected_basis_shape}"
+        )
+    if not np.array_equal(sidecar_basis, model_basis):
+        raise ValueError("Checkpoint decoder basis does not exactly match the encoded dataset basis")
+    if not np.allclose(model_basis.sum(axis=1), 1.0, atol=1e-6):
+        raise ValueError("B-spline decode basis does not form a partition of unity")
+    if not np.allclose(model_basis[0], np.eye(1, num_controls, 0)[0], atol=1e-6):
+        raise ValueError("B-spline decode basis is not left-clamped at the first control point")
+
     action_stats = policy._norm_processors["new_embodiment"]._norm_stats["new_embodiment"]["action"]
     action_low = np.asarray(action_stats["min"], dtype=np.float32)
     action_high = np.asarray(action_stats["max"], dtype=np.float32)
@@ -239,9 +280,22 @@ def main() -> None:
         "evaluated_observations": int(len(sample_indices)),
         "episodes": int(len(np.unique(episode_ids))),
         "batch_size": args.batch_size,
-        "action_frequency_hz": 25.0,
-        "control_shape_per_observation": [13, 7],
-        "decoded_action_shape_per_observation": [20, 7],
+        "action_frequency_hz": frequency_hz,
+        "control_shape_per_observation": [num_controls, action_dim],
+        "decoded_action_shape_per_observation": [horizon, action_dim],
+        "bspline_decoder": {
+            "method": "cubic_B_spline_basis_matrix_times_control_points",
+            "mode": "uniform_left",
+            "degree": degree,
+            "span_length_steps": span_length_steps,
+            "basis_shape": list(model_basis.shape),
+            "basis_matches_encoded_dataset_exactly": True,
+            "partition_of_unity_max_error": float(
+                np.max(np.abs(model_basis.sum(axis=1) - 1.0))
+            ),
+            "left_clamped_first_row": model_basis[0].tolist(),
+            "controls_dataset": str(controls_root),
+        },
         "normalized_control_prediction": _control_metrics(control_error),
         "physical_action_prediction_vs_spline_target": _trajectory_metrics(spline_prediction_error),
         "physical_action_prediction_vs_original_target": model_raw_metrics,

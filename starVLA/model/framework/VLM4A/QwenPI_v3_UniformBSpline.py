@@ -40,7 +40,7 @@ class QwenPI_v3_UniformBSpline(Qwen_PI_v3):
             end_padding=bool(representation.get("end_padding", True)),
             implementation_version=str(
                 representation.get(
-                    "implementation_version", "uniform_left_extended_double_fit_v1"
+                    "implementation_version", "uniform_left_direct_fit_v1"
                 )
             ),
         )

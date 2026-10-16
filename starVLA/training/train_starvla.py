@@ -14,6 +14,7 @@ Conventions:
 import argparse
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Tuple
@@ -45,6 +46,7 @@ from starVLA.dataloader import build_dataloader
 from starVLA.model.framework.base_framework import build_framework
 from starVLA.model.framework.share_tools import apply_config_compat
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
+from starVLA.training.trainer_utils.run_budget import WallTimeBudget
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, setup_optimizer_and_scheduler, normalize_dotlist_args
 
 deepspeed_plugin = DeepSpeedPlugin()
@@ -124,6 +126,7 @@ class VLATrainer(TrainerUtils):
         self.accelerator = accelerator
 
         self.completed_steps = 0
+        self._last_saved_step = None
         self.total_batch_size = self._calculate_total_batch_size()
 
     def prepare_training(self):
@@ -138,6 +141,18 @@ class VLATrainer(TrainerUtils):
 
         self._init_checkpointing()
         self._adjust_lr_scheduler_for_resume()
+        self.budget = WallTimeBudget(
+            self.config.trainer,
+            self.config.output_dir,
+            is_main_process=self.accelerator.is_main_process,
+            start_step=self.completed_steps,
+        )
+        if self.budget.enabled:
+            logger.info(
+                f"Wall-time budget: {self.budget.budget_seconds / 3600:.2f} h per run, "
+                f"{self.budget.previous_seconds / 3600:.2f} h used by earlier sessions, "
+                f"safety margin {self.budget.safety_seconds / 60:.0f} min"
+            )
 
         freeze_modules = (
             self.config.trainer.freeze_modules
@@ -153,6 +168,7 @@ class VLATrainer(TrainerUtils):
             self.optimizer,
             self.vla_train_dataloader,
         )
+        self._maybe_load_training_state()
 
         self._init_wandb()
 
@@ -243,7 +259,15 @@ class VLATrainer(TrainerUtils):
 
         if pretrained_checkpoint:
             reload_modules = getattr(self.config.trainer, "reload_modules", None)
-            self.model = self.load_pretrained_backbones(self.model, pretrained_checkpoint, reload_modules=reload_modules)
+            strict_pretrained = bool(
+                getattr(self.config.trainer, "strict_pretrained_checkpoint", False)
+            )
+            self.model = self.load_pretrained_backbones(
+                self.model,
+                pretrained_checkpoint,
+                reload_modules=reload_modules,
+                strict=strict_pretrained,
+            )
             self.completed_steps = 0
             self.resume_from_checkpoint = pretrained_checkpoint
             logger.info(f"Loaded pretrained checkpoint: {pretrained_checkpoint}, steps: {self.completed_steps}")
@@ -273,14 +297,19 @@ class VLATrainer(TrainerUtils):
             checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
 
             state_dict = self.accelerator.get_state_dict(self.model)
+            # Write then rename, so an interrupted save never leaves a truncated
+            # ``steps_N`` file for ``is_resume`` to pick up.
             if save_format == "safetensors":
                 from safetensors.torch import save_file
 
-                save_file(state_dict, checkpoint_path + "_model.safetensors")
+                target = checkpoint_path + "_model.safetensors"
+                save_file(state_dict, target + ".tmp")
             elif save_format == "pt":
-                torch.save(state_dict, checkpoint_path + "_pytorch_model.pt")
+                target = checkpoint_path + "_pytorch_model.pt"
+                torch.save(state_dict, target + ".tmp")
             else:
                 raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
+            os.replace(target + ".tmp", target)
 
             summary_data = {"steps": self.completed_steps}
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
@@ -293,6 +322,80 @@ class VLATrainer(TrainerUtils):
                 self.config.save_accessed_config(output_dir / "config.yaml", use_original_values=False)
                 logger.info("✅ Configuration files saved")
 
+        self.accelerator.wait_for_everyone()
+        self._last_saved_step = self.completed_steps
+        self._save_training_state()
+        self.budget.write_ledger(self.completed_steps, end_reason="running")
+
+    def _training_state_dir(self) -> Path:
+        return Path(self.checkpoint_dir) / "training_state"
+
+    def _save_training_state(self):
+        """Opt-in (``trainer.save_training_state``): keep ONE resumable optimizer/RNG state.
+
+        Collective.  Written to ``training_state.tmp`` and swapped in, so the
+        previous state survives an interrupted save.
+        """
+        if not getattr(self.config.trainer, "save_training_state", False):
+            return
+        state_dir = self._training_state_dir()
+        tmp_dir = state_dir.with_name("training_state.tmp")
+        old_dir = state_dir.with_name("training_state.old")
+        if self.accelerator.is_main_process and tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        self.accelerator.wait_for_everyone()
+        self.accelerator.save_state(str(tmp_dir))
+        # save_state ends with every rank writing its own random_states_<rank>.pkl into
+        # tmp_dir; without this barrier rank 0 can rename tmp_dir away mid-write.
+        self.accelerator.wait_for_everyone()
+        if self.accelerator.is_main_process:
+            (tmp_dir / "training_state_meta.json").write_text(json.dumps({"steps": self.completed_steps}) + "\n")
+            if old_dir.exists():
+                shutil.rmtree(old_dir)
+            if state_dir.exists():
+                os.replace(state_dir, old_dir)
+            os.replace(tmp_dir, state_dir)
+            if old_dir.exists():
+                shutil.rmtree(old_dir)
+            self.accelerator.print(f"✅ Training state saved at {state_dir} (step {self.completed_steps})")
+        self.accelerator.wait_for_everyone()
+
+    def _maybe_load_training_state(self):
+        """On ``is_resume``, restore optimizer/RNG state saved at the same step as the weights."""
+        if not (
+            getattr(self.config.trainer, "is_resume", False)
+            and getattr(self.config.trainer, "save_training_state", False)
+            and self.completed_steps > 0
+        ):
+            return
+        state_dir = self._training_state_dir()
+        meta_path = state_dir / "training_state_meta.json"
+        state_step = json.loads(meta_path.read_text())["steps"] if meta_path.exists() else None
+        if state_step != self.completed_steps:
+            logger.warning(
+                f"No training state for step {self.completed_steps} (found {state_step}); "
+                "resuming with weights only and a fresh optimizer."
+            )
+            return
+        self.accelerator.load_state(str(state_dir))
+        self._last_saved_step = self.completed_steps
+        logger.info(f"Restored optimizer/RNG training state from {state_dir} (step {state_step})")
+
+    def _graceful_stop(self):
+        """Checkpoint and exit before the wall-time budget or on a stop signal."""
+        reason = self.budget.stop_reason
+        logger.warning(
+            f"Graceful stop ({reason}, signal={self.budget.signal_name}) at step {self.completed_steps}; "
+            f"{self.budget.remaining_seconds() / 60:.1f} min of budget left"
+        )
+        if self._last_saved_step != self.completed_steps:
+            self._save_checkpoint()
+        self.budget.write_ledger(self.completed_steps, end_reason=reason)
+        if self.accelerator.is_main_process and getattr(self, "_wandb_enabled", False):
+            try:
+                wandb.finish()
+            except Exception:
+                pass
         self.accelerator.wait_for_everyone()
 
     def _log_metrics(self, metrics):
@@ -385,6 +488,13 @@ class VLATrainer(TrainerUtils):
             if self.completed_steps >= self.config.trainer.max_train_steps:
                 break
 
+            if optimizer_stepped:
+                if self.completed_steps % self.config.trainer.logging_frequency == 0:
+                    self.budget.write_ledger(self.completed_steps, end_reason="running")
+                if self.budget.should_stop(self.accelerator.device):
+                    self._graceful_stop()
+                    return
+
         self._finalize_training()
 
     def eval_action_model(self, step_metrics: dict = None) -> float:
@@ -464,6 +574,7 @@ class VLATrainer(TrainerUtils):
             else:
                 raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
+        self.budget.write_ledger(self.completed_steps, end_reason="completed")
 
         if self.accelerator.is_main_process and getattr(self, "_wandb_enabled", False):
             try:
