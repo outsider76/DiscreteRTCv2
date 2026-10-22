@@ -213,6 +213,13 @@ Open-loop at step 30,000 (same evaluator, all 11,911 held-out observations; ever
 | gripper RMSE | 0.136 (replay 0.127) | 0.133 (replay 0.124) | |
 
 Replay at step 20,000 (stride 3): raw .068 .090 .104 .067 .099 .129, B-spline .063 .087 .102 .062 .107 .122.
+**Uploaded (2026-10-22):** step 30,000 of both runs to `DiscreteRTC/dRTC/StarVLA/<run_id>/` (same layout as the
+earlier uploads: `checkpoints/steps_30000_pytorch_model.pt` + `config.yaml`, `config.full.yaml`,
+`dataset_statistics.json`, `summary.jsonl`, `wall_time_ledger.json`). 5.85 GB each; local SHA-256 raw `cf0476f9…`,
+B-spline `e52ac4e8…`; HF commits raw `86b86c78`, B-spline `aa222434`. Remote size and LFS SHA-256 match; recorded
+in each run's `checkpoint_upload.json`. Command: `upload_piper_demos_starvla_checkpoints.py --runs <both 30k run_ids>
+--step 30000`. Code at `b579523`.
+
 30k vs 10k: a small, consistent improvement (q[t+30] RMSE −2…−8 %, correlations up 0.01–0.07); the two
 representations stay within noise of each other (B-spline marginally ahead on joints 1 and 6). Joint 4 is still
 only at hold-position level. Reports/plots: `<30k run_dir>/open_loop_delta_joint/steps_30000/`.
