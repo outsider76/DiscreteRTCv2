@@ -73,6 +73,23 @@ def source_record_count(dataset_path: Path) -> int:
     return total
 
 
+def check_sidecar_action_mode(manifest: dict, dataset: LeRobotSingleDataset) -> None:
+    """Spline controls must be fitted for the dataloader's action_mode, or targets and statistics disagree.
+
+    Absolute sidecars carry no ``action_mode``; state-relative ones
+    (``data_files/build_relative_spline_sidecar.py``) record mode and apply keys.
+    """
+    sidecar = manifest.get("action_mode", "abs"), list(manifest.get("action_mode_apply_keys") or [])
+    loader = dataset._action_mode or "abs", list(dataset._action_mode_apply_keys or [])
+    if sidecar[0] == loader[0] == "abs":
+        return
+    if sidecar != loader:
+        raise ValueError(
+            f"Spline controls {dataset.controls_dataset_path} were fitted for action_mode={sidecar[0]} "
+            f"(apply_keys {sidecar[1]}), but the dataloader uses action_mode={loader[0]} (apply_keys {loader[1]})"
+        )
+
+
 class UniformBSplineLeRobotDataset(LeRobotSingleDataset):
     """Pair LeRobot observations with observation-aligned spline controls.
 
@@ -92,12 +109,17 @@ class UniformBSplineLeRobotDataset(LeRobotSingleDataset):
         action_dim: int = 7,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
+        # Set before super().__init__: statistics (computed there) read the spline horizon.
         self.controls_dataset_path = Path(controls_dataset_path).expanduser().resolve()
         self.spline_chunk_size = int(chunk_size)
         self.spline_num_basis = int(num_basis)
         self.control_action_dim = int(action_dim)
+        super().__init__(*args, **kwargs)
         self._controls_by_episode = self._load_controls()
+
+    def _statistics_action_indices(self) -> list[int]:
+        # Controls live in the physical action space; delta/rel statistics cover the decoded horizon.
+        return list(range(self.spline_chunk_size))
 
     def _load_controls(self) -> dict[int, np.ndarray]:
         manifest_path = self.controls_dataset_path / "manifest.json"
@@ -121,6 +143,7 @@ class UniformBSplineLeRobotDataset(LeRobotSingleDataset):
         actual = {key: config.get(key) for key in expected}
         if actual != expected:
             raise ValueError(f"Unexpected UniformBSpline encoder config: expected {expected}, got {actual}")
+        check_sidecar_action_mode(manifest, self)
         if manifest.get("source_dataset"):
             source_name = Path(manifest["source_dataset"]).name
             if source_name != self.dataset_path.name:
@@ -276,6 +299,7 @@ class AdaptiveBSplineLeRobotDataset(LeRobotSingleDataset):
             raise ValueError(f"Unexpected AdaptiveBSpline encoder config: expected {expected}, got {actual}")
         if manifest.get("policy_layout") != "control_point_duration_interleaved_v1":
             raise ValueError("AdaptiveBSpline sidecar does not use canonical interleaving")
+        check_sidecar_action_mode(manifest, self)
         if manifest.get("source_dataset"):
             source_name = Path(manifest["source_dataset"]).name
             if source_name != self.dataset_path.name:
@@ -470,5 +494,19 @@ for _task in PIPER_DEMOS_TASKS:
     ]
     DATASET_NAMED_MIXTURES[f"piper_demos_{_task}_30hz_uniform_left_bspline"] = [
         (f"{PIPER_DEMOS_PROCESSED_ROOT}/{_task}_30hz_cleanup", 1.0, "piper_uniform_left_bspline_30step"),
+    ]
+
+# The same tasks built with ``--preset state-delta-joint``: action = per-step measured joint
+# increment q[t+1]-q[t] (6) + absolute measured gripper[t+1].  The raw mixture predicts 30
+# increments (joints are marked non-absolute, so chunks past the episode end pad with zero);
+# the B-spline mixture reads the dataset's own ``..._spline_uniform_left_s2_h30_c18`` sidecar.
+# Deployment integrates a chunk back to joint targets with q[t] + cumsum.
+PIPER_DEMOS_DELTA_JOINT_ROOT = "processed/piper_demos/StateDeltaJoint"
+for _task in PIPER_DEMOS_TASKS:
+    DATASET_NAMED_MIXTURES[f"piper_demos_{_task}_30hz_delta_joint_raw_h30"] = [
+        (f"{PIPER_DEMOS_DELTA_JOINT_ROOT}/{_task}_30hz_cleanup", 1.0, "piper_abs_joints_30step"),
+    ]
+    DATASET_NAMED_MIXTURES[f"piper_demos_{_task}_30hz_delta_joint_uniform_left_bspline"] = [
+        (f"{PIPER_DEMOS_DELTA_JOINT_ROOT}/{_task}_30hz_cleanup", 1.0, "piper_uniform_left_bspline_30step"),
     ]
 del _task

@@ -23,6 +23,14 @@ from huggingface_hub import CommitOperationAdd, HfApi
 RUNS = (
     "piper_demos_classify_blocks_30hz_qwenpi_raw_h30_2gpu_gb32_30k",
     "piper_demos_classify_blocks_30hz_qwenpi_uniform_left_s2_h30_c18_2gpu_gb32_30k",
+    # Qwen3-VL-2B, delta (state-relative) joint targets; stopped on request at 2026-10-19.
+    "piper_demos_classify_blocks_30hz_qwenpi_qwen3vl2b_raw_h30_reljoints_2gpu_gb32_30k",
+    "piper_demos_classify_blocks_30hz_qwenpi_qwen3vl2b_uniform_left_s2_h30_c18_reljoints_2gpu_gb32_30k",
+    # Qwen3-VL-2B, per-step delta joints (StateDeltaJoint dataset): 10k runs and their 30k continuations; 2026-10-22.
+    "piper_demos_classify_blocks_30hz_qwenpi_qwen3vl2b_delta_joint_raw_h30_2gpu_gb32_10k",
+    "piper_demos_classify_blocks_30hz_qwenpi_qwen3vl2b_delta_joint_uniform_left_s2_h30_c18_2gpu_gb32_10k",
+    "piper_demos_classify_blocks_30hz_qwenpi_qwen3vl2b_delta_joint_raw_h30_2gpu_gb32_30k",
+    "piper_demos_classify_blocks_30hz_qwenpi_qwen3vl2b_delta_joint_uniform_left_s2_h30_c18_2gpu_gb32_30k",
 )
 
 REMOTE_ROOT = "StarVLA"
@@ -110,8 +118,8 @@ def main() -> None:
     parser.add_argument("--step", type=int, default=30000)
     parser.add_argument("--timeout-seconds", type=int, default=24 * 60 * 60)
     parser.add_argument("--poll-seconds", type=int, default=300)
-    parser.add_argument("--runs", nargs="+", choices=RUNS, default=list(RUNS),
-                        help="Subset of runs to wait for and upload (default: all).")
+    parser.add_argument("--runs", nargs="+", choices=RUNS, default=list(RUNS[:2]),
+                        help="Runs to wait for and upload (default: the two 4B classify_blocks runs).")
     parser.add_argument("--stopped-early", action="store_true",
                         help="Upload --step from a run stopped before max_train_steps (no final_model/ required).")
     parser.add_argument("--dry-run", action="store_true", help="Validate and list uploads only.")

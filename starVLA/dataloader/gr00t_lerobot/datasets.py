@@ -851,7 +851,7 @@ class LeRobotSingleDataset(Dataset):
         state_cfg = self.modality_configs.get("state")
         action_keys_full = list(action_cfg.modality_keys) if action_cfg else []
         state_keys_full = list(state_cfg.modality_keys) if state_cfg else []
-        action_indices = list(action_cfg.delta_indices) if action_cfg else None
+        action_indices = self._statistics_action_indices()
         state_indices = list(state_cfg.delta_indices) if state_cfg else None
 
         apply_keys = _normalize_action_mode_apply_keys(
@@ -864,6 +864,21 @@ class LeRobotSingleDataset(Dataset):
         stats_cache_config = _build_stats_cache_config(
             action_mode=action_mode,
         )
+        stats_suffix = ""
+        if action_mode != "abs":
+            # delta/rel statistics depend on the chunk and on which keys are converted.  They get
+            # their own cache file so absolute caches (and other horizons) are never invalidated.
+            stats_cache_config = {
+                **stats_cache_config,
+                "action_indices": action_indices,
+                "state_indices": state_indices,
+                "action_mode_apply_keys": apply_keys,
+                "action_mode_state_map": normalized_state_map,
+            }
+            stats_suffix = f"_{action_mode}_" + hashlib.sha256(
+                json.dumps(stats_cache_config, sort_keys=True).encode()
+            ).hexdigest()[:8]
+            stats_path = self.dataset_path / f"meta/stats_gr00t{stats_suffix}.json"
         parquet_files = list(self.dataset_path.glob(LE_ROBOT_DATA_FILENAME))
         parquet_files_filtered = [
             pf for pf in parquet_files if "episode_033675.parquet" not in pf.name
@@ -874,7 +889,7 @@ class LeRobotSingleDataset(Dataset):
             parquet_files_filtered = [
                 pf for pf in parquet_files_filtered if _parquet_episode_index(pf) in self._split_episode_ids
             ]
-            stats_path = self.dataset_path / f"meta/stats_gr00t_{self._episode_split}.json"
+            stats_path = self.dataset_path / f"meta/stats_gr00t_{self._episode_split}{stats_suffix}.json"
             stats_cache_config = {
                 **stats_cache_config,
                 "episode_split": self._episode_split,
@@ -1263,6 +1278,15 @@ class LeRobotSingleDataset(Dataset):
         for modality, config in self.modality_configs.items():
             modality_keys[modality] = config.modality_keys
         return modality_keys
+
+    def _statistics_action_indices(self) -> list[int] | None:
+        """Action chunk offsets used for delta/rel statistics (the sampled action indices).
+
+        Subclasses whose action rows are not physical steps (e.g. spline controls) override this
+        so statistics cover the physical horizon the rows decode to.
+        """
+        action_cfg = self.modality_configs.get("action")
+        return list(action_cfg.delta_indices) if action_cfg else None
 
     def _get_delta_indices(self) -> dict[str, np.ndarray]:
         """Restructure the delta indices to use modality.key as keys instead of just the modalities."""

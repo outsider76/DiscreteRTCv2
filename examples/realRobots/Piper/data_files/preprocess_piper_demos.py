@@ -25,6 +25,15 @@ starVLA's Piper data configs (and the deployment observation contract derived
 from them) read ``state.joints``/``state.gripper``, so this driver adds those
 two names to ``meta/modality.json`` as aliases of the SAME columns.
 
+``--preset state-delta-joint`` builds the BSplineEncoder per-step delta variant instead
+(``<output>/StateDeltaJoint/<task>_30hz_cleanup`` plus the same-geometry sidecar):
+
+* action = measured joint increment ``q[t+1] - q[t]`` (6, rad) + absolute measured
+  gripper[t+1] (offset 1; the last row of each episode, which has no next sample, is dropped);
+* the sidecar fits each 30-step window of those per-step increments, so a decoded chunk is
+  integrated back to joint targets with ``q[t] + cumsum``;
+* its summary goes to ``<output>/StateDeltaJoint/PREPROCESSING.json``.
+
 Language instructions: by default the pipeline's short task names are kept
 ("Classify the blocks.", "Hang the mug.", "Stack the cups."); the trained policies and
 their open-loop evaluations on these datasets use them.  ``--detailed-instructions``
@@ -55,6 +64,8 @@ BSPLINE_SRC = REPO_ROOT / "BSplineEncoder" / "src"
 
 TASKS = ("classify_blocks", "hanging_mug", "stacking_cup")
 PRESET = "joint-command"
+# Presets this driver can build; values are the output sub-directories (BSplineEncoder ``PRESETS``).
+SUPPORTED_PRESETS = {"joint-command": "ActionCommand/State_Joint", "state-delta-joint": "StateDeltaJoint"}
 FPS = 30.0
 SPLINE = {
     "mode": "uniform_left",
@@ -99,12 +110,17 @@ DETAILED_TASK_INSTRUCTIONS = {
 }
 
 
-def dataset_path(output_root: Path, task: str) -> Path:
-    return output_root / "ActionCommand" / "State_Joint" / f"{task}_{FPS:g}hz_cleanup"
+def dataset_path(output_root: Path, task: str, preset: str = PRESET) -> Path:
+    return output_root / SUPPORTED_PRESETS[preset] / f"{task}_{FPS:g}hz_cleanup"
 
 
-def sidecar_path(output_root: Path, task: str) -> Path:
-    dataset = dataset_path(output_root, task)
+def summary_path(output_root: Path, preset: str = PRESET) -> Path:
+    # The default preset keeps its historical location at the output root.
+    return output_root / ("" if preset == PRESET else SUPPORTED_PRESETS[preset]) / "PREPROCESSING.json"
+
+
+def sidecar_path(output_root: Path, task: str, preset: str = PRESET) -> Path:
+    dataset = dataset_path(output_root, task, preset)
     return dataset.parent / f"{dataset.name}_spline_uniform_left_s2_h30_c18"
 
 
@@ -183,6 +199,9 @@ def main() -> int:
     parser.add_argument("--raw-root", type=Path, default=REPO_ROOT / "data/raw/piper_demos")
     parser.add_argument("--output-root", type=Path, default=REPO_ROOT / "data/processed/piper_demos")
     parser.add_argument("--tasks", nargs="+", default=list(TASKS), choices=TASKS)
+    parser.add_argument("--preset", default=PRESET, choices=sorted(SUPPORTED_PRESETS),
+                        help="joint-command: absolute GELLO commands at t (default); "
+                             "state-delta-joint: per-step measured joint deltas q[t+1]-q[t]")
     parser.add_argument("--validation-episodes", type=int, default=5,
                         help="Last K episodes (recording order) form the held-out 'validation' split")
     parser.add_argument("--jobs", type=int, default=16)
@@ -198,22 +217,25 @@ def main() -> int:
 
     sys.path.insert(0, str(BSPLINE_SRC))
     import data as bspline_data
-    from data.config import config_from_mapping
+    from data.config import PRESETS, config_from_mapping
     from data.pipeline import run
 
     if Path(bspline_data.__file__).resolve().parent != (BSPLINE_SRC / "data").resolve():
         raise RuntimeError(f"`data` resolved to {bspline_data.__file__}, not the BSplineEncoder package")
 
+    if PRESETS[args.preset][1] != SUPPORTED_PRESETS[args.preset]:
+        raise RuntimeError(f"BSplineEncoder preset {args.preset} writes to {PRESETS[args.preset][1]}, "
+                           f"expected {SUPPORTED_PRESETS[args.preset]}")
     raw_root = args.raw_root.expanduser().resolve()
     output_root = args.output_root.expanduser().resolve()
     source = json.loads((raw_root / "SOURCE.json").read_text())
     summary = {"created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                "starvla_commit": git_head(REPO_ROOT), "bsplineencoder_commit": git_head(BSPLINE_SRC.parent),
                "raw_root": str(raw_root), "source_revision": source["revision"],
-               "preset": PRESET, "fps": FPS, "spline": SPLINE,
+               "preset": args.preset, "fps": FPS, "spline": SPLINE,
                "validation_episodes": args.validation_episodes, "tasks": {}}
     for task in args.tasks:
-        dataset, sidecar = dataset_path(output_root, task), sidecar_path(output_root, task)
+        dataset, sidecar = dataset_path(output_root, task, args.preset), sidecar_path(output_root, task, args.preset)
         if args.skip_existing and dataset.exists() and sidecar.exists():
             print(f"[{task}] outputs exist; re-checking only", flush=True)
             reports = []
@@ -223,7 +245,7 @@ def main() -> int:
                 "tasks": [task],
                 "task_description": DETAILED_TASK_INSTRUCTIONS[task] if args.detailed_instructions else None,
                 "output_root": str(output_root),
-                "setups": [PRESET],
+                "setups": [args.preset],
                 "cameras": {"global": "observation.images.global", "hand": "observation.images.hand"},
                 "run": {"fps": FPS, "cleanup": True, "cleanup_motion": "auto"},
                 "spline": {**SPLINE, "enabled": True, "validation_episodes": args.validation_episodes,
@@ -253,8 +275,8 @@ def main() -> int:
         print(f"[{task}] {info['total_episodes']} episodes, {info['total_frames']} frames, "
               f"splits {info['splits']}; geometry OK", flush=True)
     if not args.dry_run:
-        output_root.mkdir(parents=True, exist_ok=True)
-        path = output_root / "PREPROCESSING.json"
+        path = summary_path(output_root, args.preset)
+        path.parent.mkdir(parents=True, exist_ok=True)
         previous = json.loads(path.read_text()) if path.exists() else {"tasks": {}}
         for task, entry in summary["tasks"].items():
             # A --skip-existing re-check has no new pipeline report; keep the one from the build.

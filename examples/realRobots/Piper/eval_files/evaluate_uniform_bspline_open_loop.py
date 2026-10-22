@@ -92,6 +92,29 @@ def _load_raw_episode_actions(dataset, action_dim: int) -> dict[int, np.ndarray]
     return result
 
 
+def _relative_joint_offsets(dataset, cfg, episode_ids: np.ndarray, frame_ids: np.ndarray, action_dim: int):
+    """Per-observation offsets that turn state-relative ("delta joint") predictions into absolute commands.
+
+    ``datasets.vla_data.action_mode: rel`` on ``action.joints`` trains on ``joints[t+k] - state.joints[t]``;
+    the gripper stays absolute.  Returns ``None`` for absolute checkpoints.
+    """
+    data_cfg = cfg.datasets.vla_data
+    mode = str(data_cfg.get("action_mode", "abs")).lower()
+    if mode in ("abs", "absolute", "raw"):
+        return None
+    apply_keys = [str(key) for key in (data_cfg.get("action_mode_apply_keys") or [])]
+    if mode != "rel" or apply_keys not in (["action.joints"], ["joints"]):
+        raise ValueError(f"Only action_mode=rel on action.joints is supported, got {mode} on {apply_keys}")
+    offsets = np.zeros((len(episode_ids), 1, action_dim), dtype=np.float32)
+    states = {}
+    for row, (episode_id, frame_id) in enumerate(zip(episode_ids, frame_ids)):
+        if episode_id not in states:
+            frame = dataset.get_trajectory_data(int(episode_id))
+            states[episode_id] = np.stack(frame["observation.state"].to_numpy()).astype(np.float32)
+        offsets[row, 0, :6] = states[episode_id][frame_id, :6]
+    return offsets
+
+
 def _raw_action_chunks(
     dataset,
     raw_actions: dict[int, np.ndarray],
@@ -172,6 +195,7 @@ def main() -> None:
     raw_targets, episode_ids, frame_ids = _raw_action_chunks(
         dataset, raw_actions, sample_indices, horizon=horizon, action_dim=action_dim
     )
+    relative_offsets = _relative_joint_offsets(dataset, cfg, episode_ids, frame_ids, action_dim)
 
     subset = Subset(dataset, sample_indices.tolist())
     loader_kwargs = {
@@ -259,10 +283,17 @@ def main() -> None:
     representation_error = spline_target_actions - raw_targets
     persistence_actions = np.repeat(raw_targets[:, :1, :], raw_targets.shape[1], axis=1)
     persistence_error = persistence_actions - raw_targets
+    # Range check in the trained (possibly state-relative) action space, before offsets are added.
     outside = np.logical_or(
         predicted_actions < action_low[None, None, :],
         predicted_actions > action_high[None, None, :],
     )
+    if relative_offsets is not None:
+        predicted_actions = predicted_actions + relative_offsets
+        spline_target_actions = spline_target_actions + relative_offsets
+        spline_prediction_error = predicted_actions - spline_target_actions
+        raw_prediction_error = predicted_actions - raw_targets
+        representation_error = spline_target_actions - raw_targets
     inference_array = np.asarray(inference_seconds, dtype=np.float64)
 
     model_raw_metrics = _trajectory_metrics(raw_prediction_error)
@@ -281,6 +312,7 @@ def main() -> None:
         "episodes": int(len(np.unique(episode_ids))),
         "batch_size": args.batch_size,
         "action_frequency_hz": frequency_hz,
+        "action_mode": "abs" if relative_offsets is None else "rel(action.joints): metrics after adding state.joints[t]",
         "control_shape_per_observation": [num_controls, action_dim],
         "decoded_action_shape_per_observation": [horizon, action_dim],
         "bspline_decoder": {
